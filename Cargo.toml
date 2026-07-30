@@ -1,6 +1,6 @@
 [package]
 name = "zed-reload"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "Restart Zed and inject a message into the Agent Panel (Windows)"
 
@@ -15,14 +15,15 @@ codegen-units = 1
 strip = true
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 windows-sys = { version = "0.59", features = [
   "Win32_Foundation",
   "Win32_Security",
-  "Win32_UI_WindowsAndMessaging",
-  "Win32_UI_Input_KeyboardAndMouse",
-  "Win32_System_Threading",
-  "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_DataExchange",
+  "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_Memory",
   "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
 ] }
