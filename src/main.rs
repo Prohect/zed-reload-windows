@@ -84,7 +84,7 @@ struct Args {
     // ── timing ────────────────────────────────────────────────────
 
     /// Seconds to wait before acting.
-    #[arg(long, default_value = "6")]
+    #[arg(long, default_value = "26")]
     wait: u64,
 
     /// Seconds to wait after the Zed window appears (session-restore, etc.).
@@ -92,16 +92,16 @@ struct Args {
     settle: u64,
 
     /// Graceful-close budget (seconds) before force-kill.
-    #[arg(long, default_value = "20")]
+    #[arg(long, default_value = "42")]
     grace: u64,
 
     /// Max seconds to wait for the Zed window.
-    #[arg(long, default_value = "90")]
+    #[arg(long, default_value = "16")]
     window_timeout: u64,
 
     /// Seconds between the heads-up focus and the injection focus.  Gives the
     /// user time to stop any keyboard/mouse activity that could interfere.
-    #[arg(long, default_value = "3")]
+    #[arg(long, default_value = "2")]
     heads_up: u64,
 
     // ── misc ──────────────────────────────────────────────────────
