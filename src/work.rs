@@ -10,9 +10,7 @@
 use std::thread::sleep;
 use std::time::Duration;
 
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    VK_LCONTROL, VK_LSHIFT, VK_OEM_2, VK_RETURN, VK_V,
-};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_LCONTROL, VK_RETURN, VK_V};
 
 use crate::log::Log;
 use crate::win32;
@@ -83,9 +81,10 @@ pub fn inject(
             log.error(&format!("clipboard: {e}"));
             return false;
         }
-        // Toggle agent panel focus.
-        log.info("sending ctrl+shift+/  (agent::ToggleFocus)");
-        win32::send_combo(&[VK_LCONTROL, VK_LSHIFT, VK_OEM_2]);
+        // Toggle agent panel focus (use the user's custom binding if any).
+        let toggle_keys = zed::detect_toggle_binding();
+        log.info(&format!("sending agent::ToggleFocus  ({:?})", toggle_keys));
+        win32::send_combo(&toggle_keys);
         sleep(Duration::from_millis(1600));
         // Paste.
         log.info("sending ctrl+v  (paste)");

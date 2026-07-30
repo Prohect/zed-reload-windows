@@ -351,6 +351,10 @@ fn run_check(args: &Args) -> i32 {
         "  send key   : {} (auto-detected)",
         if zed::detect_ctrl_enter() { "ctrl+enter" } else { "enter" },
     );
+    println!(
+        "  toggle key : {:?} (from keymap.json)",
+        zed::detect_toggle_binding(),
+    );
 
     let log = Log::new("check");
     println!("  log file   : {}", log.path().display());

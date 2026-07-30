@@ -101,6 +101,157 @@ pub fn detect_ctrl_enter() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// keybinding detection (keymap.json)
+// ---------------------------------------------------------------------------
+
+/// Return the virtual-key sequence for `agent::ToggleFocus`.
+///
+/// Reads `%APPDATA%\Zed\keymap.json` and looks for a custom binding that
+/// maps to `"agent::ToggleFocus"`.  If none is found the Zed default
+/// (`Ctrl+Shift+/`) is returned.
+pub fn detect_toggle_binding() -> Vec<u16> {
+    let default: Vec<u16> = vec![
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_LCONTROL,
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_LSHIFT,
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_OEM_2,
+    ];
+
+    let Ok(appdata) = env::var("APPDATA") else {
+        return default;
+    };
+    let raw =
+        fs::read_to_string(PathBuf::from(appdata).join(r"Zed\keymap.json")).unwrap_or_default();
+
+    // Find the string `"agent::ToggleFocus"` and extract the preceding key.
+    let Some(action_pos) = raw.find("\"agent::ToggleFocus\"") else {
+        return default;
+    };
+
+    // Walk backwards from the action to find the key string before ':'
+    let before = &raw[..action_pos];
+    let Some(colon) = before.rfind(':') else {
+        return default;
+    };
+    let before_colon = &before[..colon];
+    let Some(close_quote) = before_colon.rfind('"') else {
+        return default;
+    };
+    let before_close = &before_colon[..close_quote];
+    let Some(open_quote) = before_close.rfind('"') else {
+        return default;
+    };
+    let binding_str = &before_colon[open_quote + 1..close_quote];
+
+    parse_binding(binding_str).unwrap_or(default)
+}
+
+/// Parse a Zed keybinding string like `"ctrl-shift-/"` into virtual-key codes.
+/// Handles the minus-key edge case (`ctrl-shift--`).
+/// Returns `None` if any segment is unrecognised.
+pub fn parse_binding(s: &str) -> Option<Vec<u16>> {
+    let parts: Vec<&str> = s.split('-').collect();
+    let mut keys = Vec::new();
+    let mut i = 0;
+
+    // Consume known modifiers from the front.
+    while i < parts.len() {
+        match parts[i].to_lowercase().as_str() {
+            "ctrl" | "control" => {
+                keys.push(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_LCONTROL);
+                i += 1;
+            }
+            "shift" => {
+                keys.push(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_LSHIFT);
+                i += 1;
+            }
+            "alt" | "option" => {
+                keys.push(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_LMENU);
+                i += 1;
+            }
+            "meta" | "cmd" | "super" => {
+                keys.push(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_LWIN);
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+
+    // Everything after the last modifier is the key, re-joined with '-'.
+    // This handles the minus-key edge case: "ctrl-shift--"  → key is "-".
+    let key_str = parts[i..].join("-");
+    if key_str.is_empty() {
+        return None;
+    }
+    keys.push(key_to_vk(&key_str)?);
+    Some(keys)
+}
+
+/// Map a single key name (e.g. `"/"`, `"enter"`, `"f5"`) to its virtual-key code.
+fn key_to_vk(name: &str) -> Option<u16> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_INSERT,
+        VK_LEFT, VK_NEXT, VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5,
+        VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD,
+        VK_OEM_PLUS, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
+    };
+
+    let lower = name.to_lowercase();
+
+    // Single character (letters, digits — VK codes match ASCII uppercase).
+    if lower.chars().count() == 1 {
+        let c = lower.chars().next().unwrap();
+        return match c {
+            'a'..='z' => Some(c.to_ascii_uppercase() as u16),
+            '0'..='9' => Some(c as u16),
+            '/' => Some(VK_OEM_2),
+            ';' => Some(VK_OEM_1),
+            '\'' => Some(VK_OEM_7),
+            '[' => Some(VK_OEM_4),
+            ']' => Some(VK_OEM_6),
+            '\\' => Some(VK_OEM_5),
+            ',' => Some(VK_OEM_COMMA),
+            '.' => Some(VK_OEM_PERIOD),
+            '-' => Some(VK_OEM_MINUS),
+            '=' => Some(VK_OEM_PLUS),
+            '`' => Some(VK_OEM_3),
+            _ => None,
+        };
+    }
+
+    // Named keys.
+    match lower.as_str() {
+        "enter" | "return" => Some(VK_RETURN),
+        "escape" | "esc" => Some(VK_ESCAPE),
+        "tab" => Some(VK_TAB),
+        "space" => Some(VK_SPACE),
+        "backspace" => Some(VK_BACK),
+        "delete" | "del" => Some(VK_DELETE),
+        "insert" | "ins" => Some(VK_INSERT),
+        "home" => Some(VK_HOME),
+        "end" => Some(VK_END),
+        "pageup" | "pgup" => Some(VK_PRIOR),
+        "pagedown" | "pgdn" => Some(VK_NEXT),
+        "up" => Some(VK_UP),
+        "down" => Some(VK_DOWN),
+        "left" => Some(VK_LEFT),
+        "right" => Some(VK_RIGHT),
+        s if s.starts_with('f') => {
+            if let Ok(n) = s[1..].parse::<u16>() {
+                if (1..=15).contains(&n) {
+                    // VK_F1 == 112, VK_Fn = 112 + n - 1
+                    Some(112u16 + n - 1)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // stop
 // ---------------------------------------------------------------------------
 
