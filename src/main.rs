@@ -1,6 +1,6 @@
 // zed-reload - restart Zed and inject a message into the Agent Panel (Windows).
 //
-// Rust port of zed-reload.ps1. One binary, two roles:
+// Two roles:
 //   launcher (default)  - writes the message to a temp file, re-spawns itself
 //                         DETACHED (survives Zed's death), returns immediately.
 //   worker   (--worker) - does the work: kill/relaunch Zed, wait for window,
