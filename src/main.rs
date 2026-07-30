@@ -419,12 +419,17 @@ fn spawn_process(cmdline: &str, creation_flags: u32) -> Result<u32, String> {
 
 fn start_zed(log: &Log, args: &Args) -> Result<(), String> {
     let exe = find_zed_exe(&args.zed_path).ok_or("Zed.exe not found")?;
+    // Launch through explorer.exe so Zed's parent is the desktop shell (same as
+    // a manual start). Direct spawn leaves Zed under a console-process ancestry,
+    // which makes its terminal shell detection fall back to PowerShell instead
+    // of auto-detecting bash. explorer.exe provides the desktop environment and
+    // forks off immediately — the returned PID is not Zed's.
     let cmdline = match &args.project {
-        Some(p) => format!("\"{}\" \"{}\"", exe.display(), p),
-        None => format!("\"{}\"", exe.display()),
+        Some(p) => format!("explorer.exe \"{}\" \"{}\"", exe.display(), p),
+        None => format!("explorer.exe \"{}\"", exe.display()),
     };
     log.line(&format!(
-        "starting {} {}",
+        "starting {} via explorer.exe {}",
         exe.display(),
         if args.project.is_some() {
             format!("project='{}'", args.project.as_ref().unwrap())
