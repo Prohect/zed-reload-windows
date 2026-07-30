@@ -6,6 +6,8 @@
 use std::thread::sleep;
 use std::time::Duration;
 
+use crate::log::Log;
+
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::DataExchange::*;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
@@ -297,10 +299,14 @@ pub fn spawn(cmdline: &str, flags: u32) -> Result<u32, String> {
 /// 3. Phantom `VK_F15` input (satisfies foreground lock) + `SetForegroundWindow`
 ///
 /// Returns `true` if the window ended up in the foreground.
-pub fn force_foreground(hwnd: HWND) -> bool {
-    for _attempt in 1..=15u32 {
+pub fn force_foreground(log: &Log, hwnd: HWND) -> bool {
+    for attempt in 1..=15u32 {
         unsafe {
             if GetForegroundWindow() == hwnd {
+                log.info(&format!(
+                    "foreground=true after {} attempt(s)",
+                    attempt - 1,
+                ));
                 return true;
             }
             if IsIconic(hwnd) == TRUE {
@@ -311,6 +317,9 @@ pub fn force_foreground(hwnd: HWND) -> bool {
             SwitchToThisWindow(hwnd, TRUE);
             sleep(Duration::from_millis(200));
             if GetForegroundWindow() == hwnd {
+                log.info(&format!(
+                    "foreground=true via SwitchToThisWindow (attempt {attempt})",
+                ));
                 return true;
             }
 
@@ -329,6 +338,9 @@ pub fn force_foreground(hwnd: HWND) -> bool {
             }
             sleep(Duration::from_millis(200));
             if GetForegroundWindow() == hwnd {
+                log.info(&format!(
+                    "foreground=true via AttachThreadInput (attempt {attempt})",
+                ));
                 return true;
             }
 
@@ -337,9 +349,13 @@ pub fn force_foreground(hwnd: HWND) -> bool {
             let _ = SetForegroundWindow(hwnd);
             sleep(Duration::from_millis(250));
             if GetForegroundWindow() == hwnd {
+                log.info(&format!(
+                    "foreground=true via F15+SetForegroundWindow (attempt {attempt})",
+                ));
                 return true;
             }
         }
     }
+    log.info("foreground=false after 15 attempts");
     false
 }

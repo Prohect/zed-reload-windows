@@ -14,11 +14,14 @@
 //! **Worker** (the detached process):
 //!   1. Reads the message from the temp file (deletes it after).
 //!   2. Waits `--wait` seconds.
-//!   3. Depending on mode:
-//!      - `--send`: inject into the running Zed.
-//!      - `--restart` (default): stop Zed, start it via `explorer.exe`,
-//!        wait for the window, inject.
-//!      - `--watch`: loop, reviving Zed if it dies or hangs.
+//!   3. Stops Zed, starts it via `explorer.exe`.
+//!   4. Two-focus injection:
+//!      a. **First focus** — brings Zed to the foreground as a heads-up
+//!         ("stop typing, something is about to happen").
+//!      b. **Heads-up delay** (`--heads-up` seconds) — user has time to
+//!         stop any keyboard/mouse activity that could interfere.
+//!      c. **Second focus** — brings Zed to foreground again, then
+//!         injects the message (Ctrl+Shift+/, paste, send).
 //!
 //! # Zed internals relied on
 //!
@@ -61,24 +64,11 @@ use crate::log::Log;
     name = "zed-reload",
     version,
     about = "Restart Zed and inject a message into the Agent Panel",
-    after_help = "Without a mode flag, --restart is assumed.\n\
-                  The log is written to zed-reload.log next to the executable.",
+    after_help = "The log is written to zed-reload.log next to the executable.",
 )]
 struct Args {
-    /// Restart Zed, then inject the message [default].
-    #[arg(long, group = "mode")]
-    restart: bool,
-
-    /// Inject into the running Zed (no restart).
-    #[arg(long, group = "mode")]
-    send: bool,
-
-    /// Watch for Zed death / hang, then revive and inject.
-    #[arg(long, group = "mode")]
-    watch: bool,
-
     /// Print diagnostics and exit (no side effects).
-    #[arg(long, group = "mode")]
+    #[arg(long)]
     check: bool,
 
     // ── internal (used by the launcher → worker handoff) ──────────
@@ -97,7 +87,7 @@ struct Args {
     #[arg(long, default_value = "6")]
     wait: u64,
 
-    /// Seconds to wait after the Zed window appears.
+    /// Seconds to wait after the Zed window appears (session-restore, etc.).
     #[arg(long, default_value = "10")]
     settle: u64,
 
@@ -109,13 +99,10 @@ struct Args {
     #[arg(long, default_value = "90")]
     window_timeout: u64,
 
-    /// Watch mode: give up after this many seconds.
-    #[arg(long, default_value = "3600")]
-    watch_timeout: u64,
-
-    /// Watch mode: revive if a window hangs this many seconds (0 = off).
-    #[arg(long, default_value = "0")]
-    unresponsive: u64,
+    /// Seconds between the heads-up focus and the injection focus.  Gives the
+    /// user time to stop any keyboard/mouse activity that could interfere.
+    #[arg(long, default_value = "3")]
+    heads_up: u64,
 
     // ── misc ──────────────────────────────────────────────────────
 
@@ -145,27 +132,7 @@ struct Args {
     message: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Mode {
-    Restart,
-    Send,
-    Watch,
-    Check,
-}
-
 impl Args {
-    fn mode(&self) -> Mode {
-        if self.check {
-            Mode::Check
-        } else if self.send {
-            Mode::Send
-        } else if self.watch {
-            Mode::Watch
-        } else {
-            Mode::Restart
-        }
-    }
-
     fn send_key(&self) -> Option<bool> {
         if self.send_enter {
             Some(false)
@@ -193,7 +160,7 @@ fn main() {
     let args = Args::parse();
 
     // `--check` is read-only – no side effects.
-    if args.mode() == Mode::Check {
+    if args.check {
         exit(run_check(&args));
     }
 
@@ -232,27 +199,17 @@ fn run_launcher(args: &Args) {
         exit(2);
     });
 
-    let mode_arg = match args.mode() {
-        Mode::Restart => "--restart",
-        Mode::Send => "--send",
-        Mode::Watch => "--watch",
-        Mode::Check => unreachable!(),
-    };
-
     // Build the worker command-line.  Paths are quoted for Windows parsing.
     let mut cmdline = format!(
-        "\"{}\" --worker {} --message-file \"{}\" \
-         --wait {} --settle {} --grace {} --window-timeout {} \
-         --watch-timeout {} --unresponsive {}",
+        "\"{}\" --worker --message-file \"{}\" \
+         --wait {} --settle {} --grace {} --window-timeout {} --heads-up {}",
         exe.display(),
-        mode_arg,
         msg_file.display(),
         args.wait,
         args.settle,
         args.grace,
         args.window_timeout,
-        args.watch_timeout,
-        args.unresponsive,
+        args.heads_up,
     );
     if let Some(p) = &args.project {
         cmdline.push_str(&format!(" --project \"{p}\""));
@@ -291,11 +248,10 @@ fn run_launcher(args: &Args) {
         Ok(pid) => {
             let log = Log::new("launcher");
             println!(
-                "zed-reload: launched detached worker pid={pid} \
-                 (mode={:?}, wait={}s, settle={}s)",
-                args.mode(),
+                "zed-reload: detached worker pid={pid}  (wait={}s, settle={}s, heads-up={}s)",
                 args.wait,
                 args.settle,
+                args.heads_up,
             );
             println!("zed-reload: log -> {}", log.path().display());
         }
@@ -328,66 +284,35 @@ fn run_worker(args: &Args) -> i32 {
         args.message()
     };
 
-    let tag = match args.mode() {
-        Mode::Restart => "restart",
-        Mode::Send => "send",
-        Mode::Watch => "watch",
-        Mode::Check => "check",
-    };
-    let log = Log::new(tag);
+    let log = Log::new("restart");
 
     log.info(&format!(
-        "=== start: msgLen={} wait={}s settle={}s grace={}s ===",
+        "=== start: msgLen={} wait={}s settle={}s grace={}s heads-up={}s ===",
         message.chars().count(),
         args.wait,
         args.settle,
         args.grace,
+        args.heads_up,
     ));
 
-    let ok = match args.mode() {
-        Mode::Send => {
-            sleep(Duration::from_secs(args.wait));
-            work::inject(
-                &log,
-                &message,
-                args.window_timeout,
-                args.settle,
-                &args.window_title,
-                args.send_key(),
-            )
-        }
-        Mode::Restart => {
-            sleep(Duration::from_secs(args.wait));
-            zed::stop(&log, args.grace);
-            match zed::start(&log, &args.zed_path, &args.project) {
-                Ok(()) => work::inject(
-                    &log,
-                    &message,
-                    args.window_timeout,
-                    args.settle,
-                    &args.window_title,
-                    args.send_key(),
-                ),
-                Err(e) => {
-                    log.error(&format!("{e}"));
-                    false
-                }
-            }
-        }
-        Mode::Watch => work::watch(
+    sleep(Duration::from_secs(args.wait));
+
+    zed::stop(&log, args.grace);
+
+    let ok = match zed::start(&log, &args.zed_path, &args.project) {
+        Ok(()) => work::inject(
             &log,
             &message,
-            args.watch_timeout,
-            args.unresponsive,
-            args.grace,
             args.window_timeout,
             args.settle,
+            args.heads_up,
             &args.window_title,
-            &args.zed_path,
-            &args.project,
             args.send_key(),
         ),
-        Mode::Check => true, // unreachable — handled before worker dispatch
+        Err(e) => {
+            log.error(&format!("{e}"));
+            false
+        }
     };
 
     log.info(&format!("=== done: ok={ok} ==="));
