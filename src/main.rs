@@ -59,6 +59,7 @@ use crate::log::Log;
 #[derive(Parser, Debug)]
 #[command(
     name = "zed-reload",
+    version,
     about = "Restart Zed and inject a message into the Agent Panel",
     after_help = "Without a mode flag, --restart is assumed.\n\
                   The log is written to zed-reload.log next to the executable.",
