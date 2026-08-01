@@ -324,6 +324,10 @@ pub fn start(
             }
 
             let lnk = env::temp_dir().join(format!("zed-reload-{}.lnk", std::process::id()));
+            // Minimized launch rides on the shortcut's "Run: Minimized"
+            // (SW_SHOWMINIMIZED in STARTUPINFO), which gpui_windows honors —
+            // so the restart does not steal focus.  No CLI flag: Zed rejects
+            // unknown arguments.
             if let Err(e) = win32::write_shortcut(&exe, &format!("\"{p}\""), p, &lnk) {
                 let _ = fs::remove_file(&lnk);
                 return Err(e);
@@ -354,17 +358,42 @@ pub fn start(
 // wait-for-window
 // ---------------------------------------------------------------------------
 
+/// Substring to match window titles against: an explicit `--window-title`
+/// wins; otherwise the project's folder name, because Zed titles windows
+/// with the project folder name.  `None` means "any visible window".
+fn title_filter(project: &Option<String>, window_title: &Option<String>) -> Option<String> {
+    match window_title {
+        Some(t) => Some(t.clone()),
+        None => project
+            .as_ref()
+            .and_then(|p| Path::new(p).file_name().map(|n| n.to_string_lossy().into_owned())),
+    }
+}
+
 /// Block until a visible Zed window appears (up to `timeout_secs`).
-/// Respects `window_title` as an optional substring filter.
+///
+/// The window is matched against `window_title` (explicit substring filter)
+/// or, failing that, against the project's folder name — Zed titles windows
+/// with the project folder name, so the injection lands in the *calling*
+/// session.  This is what makes recovery strict: with several projects
+/// open, session restore may bring a different window to the front, but the
+/// continue-message is never sent to a window that is not the caller's.
+/// If no matching window appears, `None` is returned (the caller fails
+/// rather than inject into a random session-restored window).
 pub fn wait_for_window(
+    project: &Option<String>,
     window_title: &Option<String>,
     timeout_secs: u64,
     log: &Log,
 ) -> Option<Window> {
+    let filter = title_filter(project, window_title);
+    if let Some(f) = &filter {
+        log.info(&format!("waiting for window title containing '{f}'"));
+    }
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     while Instant::now() < deadline {
         let wins = windows();
-        let filtered: Vec<&Window> = match window_title {
+        let filtered: Vec<&Window> = match &filter {
             Some(sub) => {
                 let sub = sub.to_lowercase();
                 wins.iter()
@@ -383,6 +412,38 @@ pub fn wait_for_window(
         }
         sleep(Duration::from_millis(500));
     }
-    log.error(&format!("no Zed window within {timeout_secs}s"));
+    match &filter {
+        Some(f) => log.error(&format!(
+            "no Zed window matching '{f}' within {timeout_secs}s — \
+             not injecting (strict: caller's session only; \
+             retry with --window-title to override)"
+        )),
+        None => log.error(&format!("no Zed window within {timeout_secs}s")),
+    }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn title_filter_prefers_explicit_window_title() {
+        let project = Some("F:\\workspace\\zed-reload".into());
+        let wt = Some("nightly".into());
+        assert_eq!(title_filter(&project, &wt).unwrap(), "nightly");
+    }
+
+    #[test]
+    fn title_filter_derives_project_folder_name() {
+        let project = Some("F:\\workspace\\zed-reload".into());
+        assert_eq!(title_filter(&project, &None).unwrap(), "zed-reload");
+    }
+
+    #[test]
+    fn title_filter_requires_something_to_match() {
+        assert_eq!(title_filter(&None, &None), None);
+        // A root path has no folder name to match against.
+        assert_eq!(title_filter(&Some("C:\\".into()), &None), None);
+    }
 }

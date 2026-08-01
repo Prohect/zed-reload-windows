@@ -1,11 +1,14 @@
-//! Message-injection workflow — two-focus approach.
+//! Message-injection workflow.
 //!
 //! 1. Wait for the Zed window, settle (session-restore completes).
-//! 2. **First focus** — heads-up: bring Zed to foreground so the user knows
-//!    something is about to happen.  They stop interacting.
-//! 3. **Heads-up delay** — user has time to stop any keyboard/mouse activity
-//!    that could break the keystroke injection.
-//! 4. **Second focus** — bring Zed to foreground again, then inject.
+//! 2. **Windows notification** — a tray balloon warns the user that
+//!    keystrokes are about to be injected.  Unlike a focus grab it never
+//!    steals focus and works even when Zed is already the foreground
+//!    window (where the old focus-based heads-up was a no-op).
+//! 3. **Heads-up delay** — the user has time to stop any keyboard/mouse
+//!    activity that could break the keystroke injection.
+//! 4. **Single focus** — bring Zed to the foreground (restoring it from
+//!    the minimized launch), then inject.
 
 use std::thread::sleep;
 use std::time::Duration;
@@ -30,11 +33,12 @@ pub fn inject(
     settle_secs: u64,
     heads_up_secs: u64,
     window_title: &Option<String>,
+    project: &Option<String>,
     send_key: Option<bool>, // Some(true)=ctrl+enter, Some(false)=enter
 ) -> bool {
     // ── wait for the new Zed window ────────────────────────────────
 
-    let Some(w) = zed::wait_for_window(window_title, window_timeout, log) else {
+    let Some(w) = zed::wait_for_window(project, window_title, window_timeout, log) else {
         return false;
     };
     log.info(&format!(
@@ -43,24 +47,32 @@ pub fn inject(
     ));
     sleep(Duration::from_secs(settle_secs));
 
-    // ── first focus: heads-up ──────────────────────────────────────
+    // ── heads-up: Windows notification (never steals focus) ────────
 
-    log.info("--- first focus (heads-up) ---");
-    if !win32::force_foreground(log, w.hwnd) {
-        log.error("could not focus Zed window (heads-up)");
-        return false;
+    let notify = win32::notify_balloon(
+        "zed-reload",
+        &format!("About to type into Zed in {heads_up_secs}s — stop typing!"),
+    );
+    if let Err(e) = notify {
+        log.error(&format!(
+            "notification failed: {e}; falling back to focus heads-up"
+        ));
+        log.info("--- fallback: heads-up focus ---");
+        if !win32::force_foreground(log, w.hwnd) {
+            log.error("could not focus Zed window (heads-up)");
+            return false;
+        }
+        sleep(Duration::from_millis(500));
     }
-    // Brief pause so the user *sees* Zed come to the foreground.
-    sleep(Duration::from_millis(500));
 
     // ── heads-up delay: user stops interacting ────────────────────
 
     log.info(&format!("heads-up delay: {heads_up_secs}s  (stop typing!)"));
     sleep(Duration::from_secs(heads_up_secs));
 
-    // ── second focus: do the injection ─────────────────────────────
+    // ── single focus: restore from minimized, then inject ──────────
 
-    log.info("--- second focus (injecting) ---");
+    log.info("--- focusing Zed (injecting) ---");
     if !win32::force_foreground(log, w.hwnd) {
         log.error("could not focus Zed window (injection)");
         return false;

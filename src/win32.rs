@@ -15,8 +15,9 @@ use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::DataExchange::*;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
 use windows_sys::Win32::System::Memory::*;
+use windows_sys::Win32::System::LibraryLoader::*;
 use windows_sys::Win32::System::Threading::{
-    AttachThreadInput, CreateProcessW, GetCurrentThreadId, OpenProcess,
+    AttachThreadInput, CreateProcessW, GetCurrentThreadId, GetStartupInfoW, OpenProcess,
     TerminateProcess, PROCESS_INFORMATION, PROCESS_TERMINATE, STARTUPINFOW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
@@ -239,6 +240,21 @@ fn keybd(vk: u16, flags: u32) -> INPUT {
 }
 
 // ---------------------------------------------------------------------------
+// startup info
+// ---------------------------------------------------------------------------
+
+/// The `wShowWindow` value this process was launched with
+/// (`STARTUPINFO`), or 0 if the launcher did not set one.
+pub fn startup_show_cmd() -> u16 {
+    unsafe {
+        let mut info: STARTUPINFOW = std::mem::zeroed();
+        info.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        GetStartupInfoW(&mut info);
+        info.wShowWindow
+    }
+}
+
+// ---------------------------------------------------------------------------
 // .lnk shortcut writing (IShellLinkW / IPersistFile, raw vtables)
 // ---------------------------------------------------------------------------
 //
@@ -345,6 +361,16 @@ pub fn write_shortcut(
                     "IShellLink::SetWorkingDirectory failed, HRESULT={hr:#010x}"
                 ));
             }
+            // "Run: Minimized" — best effort: explorer delivers this as
+            // `STARTUPINFO.wShowWindow` for some launch paths, but NOT via
+            // `explorer.exe "file.lnk"` (verified: arrives as SW_SHOWDEFAULT
+            // here).  Kept anyway; the injection flow handles both minimized
+            // and normal windows.  No CLI flag is used — Zed rejects unknown
+            // arguments.
+            let hr = (link_vtbl.set_show_cmd)(link_raw, SW_SHOWMINIMIZED);
+            if hr != 0 {
+                return Err(format!("IShellLink::SetShowCmd failed, HRESULT={hr:#010x}"));
+            }
 
             let mut persist_raw: *mut core::ffi::c_void = std::ptr::null_mut();
             let hr = (link_vtbl.query_interface)(link_raw, &IID_IPERSISTFILE, &mut persist_raw);
@@ -421,6 +447,141 @@ mod tests {
         assert_eq!(fs::read_to_string(&marker).unwrap(), "ok");
         sleep(Duration::from_millis(500)); // let explorer release the .lnk
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// What does the shell actually deliver to a shortcut-launched process?
+    /// Launches the release binary via `explorer.exe <lnk>` and asks it to
+    /// dump `STARTUPINFO.wShowWindow` and its cwd (the `.lnk` has a working
+    /// directory, so this also reveals whether explorer honors it).  If the
+    /// arguments get mangled and the binary runs as a plain launcher, the
+    /// stray worker is killed before its `--wait` elapses.
+    #[test]
+    #[ignore = "launches processes on the real desktop"]
+    fn shortcut_delivers_show_cmd_and_workdir() {
+        let exe = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/zed-reload.exe");
+        assert!(exe.exists(), "build --release first: {}", exe.display());
+        let out = std::env::temp_dir().join("zed-reload-startup-cmd.txt");
+        let _ = fs::remove_file(&out);
+        let lnk = std::env::temp_dir().join("zed-reload-delivery-test.lnk");
+
+        write_shortcut(
+            &exe,
+            &format!("--dump-startup \"{}\"", out.display()),
+            // Deliberately distinct from explorer's own cwd (C:\Windows...)
+            &env!("CARGO_MANIFEST_DIR").replace('/', "\\"),
+            &lnk,
+        )
+        .unwrap();
+        spawn(
+            &format!("explorer.exe \"{}\"", lnk.display()),
+            CREATE_NEW_PROCESS_GROUP,
+        )
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while !out.exists() {
+            if std::time::Instant::now() > deadline {
+                // The launch got mangled into a plain launcher invocation;
+                // kill it before its worker acts on Zed.
+                for pid in super::super::win32::find_pids("zed-reload.exe") {
+                    let _ = kill(pid);
+                }
+                panic!("dump file missing; killed stray zed-reload processes");
+            }
+            sleep(Duration::from_millis(250));
+        }
+        let content = fs::read_to_string(&out).unwrap();
+        let _ = fs::remove_file(&out);
+        let _ = fs::remove_file(&lnk);
+        // The shortcut carries "Run: Minimized" (SW_SHOWMINIMIZED) and a
+        // working directory.  Explorer does NOT deliver the show-cmd through
+        // `explorer.exe "file.lnk"` on this system (it arrives as
+        // SW_SHOWDEFAULT=10), so the injection flow must not depend on a
+        // minimized start — but the working directory must be delivered,
+        // since the relaunch depends on it.
+        assert!(
+            content.contains(&format!(
+                "cwd={}",
+                env!("CARGO_MANIFEST_DIR").replace('/', "\\")
+            )),
+            "expected shortcut workdir delivered, got: {content}"
+        );
+        println!("delivered: {content}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// notification balloon
+// ---------------------------------------------------------------------------
+
+/// Show a Windows notification balloon anchored to the system tray.
+///
+/// Unlike a focus grab it never steals focus, and it works even when Zed
+/// is already the foreground window (where the old focus-based heads-up
+/// was a no-op).  The balloon is anchored to a hidden window + tray icon;
+/// the OS removes both when this process exits, which happens after the
+/// injection completes.
+pub fn notify_balloon(title: &str, text: &str) -> Result<(), String> {
+    use windows_sys::Win32::UI::Shell::{
+        NIF_ICON, NIF_INFO, NIF_MESSAGE, NIIF_INFO, NIM_ADD, NOTIFYICONDATAW, Shell_NotifyIconW,
+    };
+
+    unsafe {
+        let hinstance = GetModuleHandleW(std::ptr::null());
+        let class_name = to_wide("zed-reload-balloon");
+        let mut wc: WNDCLASSEXW = std::mem::zeroed();
+        wc.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
+        wc.lpfnWndProc = Some(DefWindowProcW);
+        wc.hInstance = hinstance;
+        wc.lpszClassName = class_name.as_ptr();
+        if RegisterClassExW(&wc) == 0 {
+            return Err(format!("RegisterClassExW failed, GLE={}", GetLastError()));
+        }
+        let hwnd = CreateWindowExW(
+            0,
+            class_name.as_ptr(),
+            std::ptr::null(),
+            WS_OVERLAPPED,
+            0,
+            0,
+            0,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            hinstance,
+            std::ptr::null_mut(),
+        );
+        if hwnd.is_null() {
+            return Err(format!("CreateWindowExW failed, GLE={}", GetLastError()));
+        }
+
+        let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = hwnd;
+        nid.uID = 1;
+        nid.uFlags = NIF_ICON | NIF_INFO | NIF_MESSAGE;
+        nid.uCallbackMessage = WM_USER + 1;
+        nid.hIcon = LoadIconW(std::ptr::null_mut(), IDI_APPLICATION);
+        nid.dwInfoFlags = NIIF_INFO;
+
+        // szInfoTitle holds 63 chars, szInfo 255 (excluding the NUL).
+        let title_wide: Vec<u16> = title
+            .encode_utf16()
+            .take(63)
+            .chain(std::iter::once(0))
+            .collect();
+        let text_wide: Vec<u16> = text
+            .encode_utf16()
+            .take(255)
+            .chain(std::iter::once(0))
+            .collect();
+        nid.szInfoTitle[..title_wide.len()].copy_from_slice(&title_wide);
+        nid.szInfo[..text_wide.len()].copy_from_slice(&text_wide);
+
+        if Shell_NotifyIconW(NIM_ADD, &nid) == 0 {
+            return Err(format!("Shell_NotifyIconW failed, GLE={}", GetLastError()));
+        }
+        Ok(())
     }
 }
 

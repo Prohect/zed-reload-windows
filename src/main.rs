@@ -14,14 +14,16 @@
 //! **Worker** (the detached process):
 //!   1. Reads the message from the temp file (deletes it after).
 //!   2. Waits `--wait` seconds.
-//!   3. Stops Zed, starts it via `explorer.exe`.
-//!   4. Two-focus injection:
-//!      a. **First focus** — brings Zed to the foreground as a heads-up
-//!         ("stop typing, something is about to happen").
-//!      b. **Heads-up delay** (`--heads-up` seconds) — user has time to
-//!         stop any keyboard/mouse activity that could interfere.
-//!      c. **Second focus** — brings Zed to foreground again, then
-//!         injects the message (Ctrl+Shift+/, paste, send).
+//!   3. Stops Zed, starts it via `explorer.exe` (best-effort minimized
+//!      start via the shortcut; explorer may deliver a normal window).
+//!   4. Single-focus injection:
+//!      a. **Windows notification** — a tray balloon warns the user
+//!         ("stop typing, something is about to happen"); unlike a focus
+//!         grab it never steals focus and works even when Zed is front.
+//!      b. **Heads-up delay** (`--heads-up` seconds) — reaction time.
+//!      c. **Single focus** — brings Zed to the foreground (restoring it
+//!         from minimized), then injects the message
+//!         (Ctrl+Shift+/, paste, send).
 //!
 //! # Zed internals relied on
 //!
@@ -34,14 +36,22 @@
 //!   not whatever session-restore puts in front.  With several projects
 //!   open, session restore may bring a different window to the front than
 //!   the one the agent invoked zed-reload from, so recovery would land in
-//!   the wrong session.
+//!   the wrong session.  The injection therefore targets the window whose
+//!   title contains the calling project's folder name (Zed titles windows
+//!   with the project folder name) — recovery is strictly the agent that
+//!   invoked zed-reload; no match means no injection.
 //!
 //! # Why `explorer.exe`?
 //!
 //! Spawning Zed directly leaves it under a console-process ancestry, which
 //! tricks its terminal-shell auto-detection into falling back to PowerShell.
 //! Launching through `explorer.exe` gives it the standard desktop-shell parent
-//! so it auto-detects the user's preferred shell correctly.
+//! so it auto-detects the user's preferred shell correctly.  The launch
+//! shortcut carries "Run: Minimized" as best-effort — explorer does not
+//! deliver it via `explorer.exe "file.lnk"` (SW_SHOWDEFAULT arrives
+//! instead), so the flow must cope with a normal (focus-stealing) start;
+//! `force_foreground` restores a minimized window via `SW_RESTORE`.
+//! Zed is never passed CLI flags — it rejects unknown arguments.
 
 mod log;
 mod win32;
@@ -79,6 +89,10 @@ struct Args {
     /// Internal: this process is the detached worker.
     #[arg(long, hide = true)]
     worker: bool,
+
+    /// Internal: write GetStartupInfoW().wShowWindow to a file and exit.
+    #[arg(long, hide = true)]
+    dump_startup: Option<String>,
 
     /// Internal: path to the temporary message file.
     #[arg(long, hide = true)]
@@ -171,6 +185,21 @@ fn main() {
     // Worker is the detached process that does the actual work.
     if args.worker {
         exit(run_worker(&args));
+    }
+
+    // Diagnostic: report the show-state and cwd this process was launched
+    // with (used to verify what the shell actually delivers to a process
+    // launched through a shortcut).
+    if let Some(f) = &args.dump_startup {
+        let _ = fs::write(
+            f,
+            format!(
+                "show={} cwd={}",
+                win32::startup_show_cmd(),
+                env::current_dir().map(|d| d.display().to_string()).unwrap_or_default(),
+            ),
+        );
+        exit(0);
     }
 
     // Launcher: write message → spawn detached worker → return.
@@ -327,6 +356,7 @@ fn run_worker(args: &Args) -> i32 {
                 args.settle,
                 args.heads_up,
                 &args.window_title,
+                &args.project,
                 args.send_key(),
             );
             // The launch is confirmed (or failed) by now; explorer has
