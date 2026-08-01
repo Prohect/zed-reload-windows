@@ -16,8 +16,9 @@
 //!   2. Waits `--wait` seconds.
 //!   3. Stops Zed, starts it via `explorer.exe` (desktop parent — keeps the
 //!      terminal-shell auto-detection on the user's shell; direct spawns
-//!      regress it to PowerShell).  The worker minimizes the Zed window as
-//!      soon as it appears, so the launch cannot hold focus.
+//!      regress it to PowerShell).  If the old session was not focused the
+//!      worker minimizes the new window as soon as it appears, so the
+//!      launch cannot hold focus.
 //!   4. Single-focus injection:
 //!      a. **Windows notification** — a tray balloon warns the user
 //!         ("stop typing, something is about to happen"); unlike a focus
@@ -52,7 +53,9 @@
 //! `STARTUPINFO.wShowWindow` (verified: a direct spawn with
 //! `SW_SHOWMINIMIZED` still opened a normal window).  The worker therefore
 //! minimizes the window the moment it appears — a brief flash to the front
-//! is unavoidable — and the injection focus restores it via `SW_RESTORE`.
+//! is unavoidable — unless the old session was focused (the user is already
+//! in Zed; nothing to protect).  The injection focus restores it via
+//! `SW_RESTORE`.
 //!
 //! # Why `explorer.exe`?
 //!
@@ -355,7 +358,7 @@ fn run_worker(args: &Args) -> i32 {
 
     sleep(Duration::from_secs(args.wait));
 
-    zed::stop(&log, args.grace);
+    let was_focused = zed::stop(&log, args.grace);
 
     let ok = match zed::start(&log, &args.zed_path, &args.project) {
         Ok(lnk) => {
@@ -367,6 +370,7 @@ fn run_worker(args: &Args) -> i32 {
                 args.heads_up,
                 &args.window_title,
                 &args.project,
+                was_focused,
                 args.send_key(),
             );
             // The launch is confirmed (or failed) by now; explorer has

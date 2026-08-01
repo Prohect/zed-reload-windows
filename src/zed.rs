@@ -257,8 +257,16 @@ fn key_to_vk(name: &str) -> Option<u16> {
 
 /// Gracefully close all Zed windows (`WM_CLOSE`), then force-kill any
 /// remaining processes after `grace_secs`.
-pub fn stop(log: &Log, grace_secs: u64) {
+///
+/// Returns whether a Zed window was the foreground window when the stop
+/// began — the caller guards the minimized relaunch on this: if the user
+/// was in Zed, the new window appearing normally is expected; if they were
+/// elsewhere, their focus is protected by minimizing the new window.
+pub fn stop(log: &Log, grace_secs: u64) -> bool {
     let wins = windows();
+    // Capture focus before closing anything: after WM_CLOSE the
+    // foreground moves to whatever was behind.
+    let was_focused = wins.iter().any(|w| win32::get_foreground() == w.hwnd);
     if wins.is_empty() {
         log.info("no Zed window to close");
     }
@@ -266,13 +274,14 @@ pub fn stop(log: &Log, grace_secs: u64) {
         log.info(&format!("WM_CLOSE pid={} title='{}'", w.pid, w.title));
         win32::post_quit(w.hwnd);
     }
+    log.info(&format!("old session focused: {was_focused}"));
 
     let deadline = Instant::now() + Duration::from_secs(grace_secs);
     while Instant::now() < deadline {
         sleep(Duration::from_millis(500));
         if win32::find_pids("zed.exe").is_empty() {
             log.info("Zed exited gracefully");
-            return;
+            return was_focused;
         }
     }
 
@@ -283,6 +292,7 @@ pub fn stop(log: &Log, grace_secs: u64) {
         win32::kill(pid);
     }
     sleep(Duration::from_secs(2));
+    was_focused
 }
 
 // ---------------------------------------------------------------------------

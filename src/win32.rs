@@ -588,6 +588,11 @@ pub fn post_quit(hwnd: HWND) {
     }
 }
 
+/// The window currently in the foreground (may be null).
+pub fn get_foreground() -> HWND {
+    unsafe { GetForegroundWindow() }
+}
+
 /// Force-terminate a process by PID.
 pub fn kill(pid: u32) {
     unsafe {

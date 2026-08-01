@@ -34,6 +34,7 @@ pub fn inject(
     heads_up_secs: u64,
     window_title: &Option<String>,
     project: &Option<String>,
+    old_was_focused: bool,
     send_key: Option<bool>, // Some(true)=ctrl+enter, Some(false)=enter
 ) -> bool {
     // ── wait for the new Zed window ────────────────────────────────
@@ -45,12 +46,14 @@ pub fn inject(
         "window found pid={} title='{}'; settling {settle_secs}s",
         w.pid, w.title,
     ));
-    // Minimize the window as soon as it appears: the launch cannot create
-    // it minimized (explorer delivers SW_SHOWDEFAULT, Zed rejects CLI
-    // flags, gpui ignores STARTUPINFO.wShowWindow), so this is the only
-    // way to keep it from holding focus during the settle.  The injection
-    // focus restores it (SW_RESTORE).
-    if win32::is_minimized(w.hwnd) {
+    // Minimize the window as soon as it appears — guarded: only when the
+    // previous session was NOT focused.  If the user was in Zed, the new
+    // window appearing is expected; if they were elsewhere, protect their
+    // focus from the relaunch.  (The launch cannot create the window
+    // minimized; the injection focus restores it via SW_RESTORE.)
+    if old_was_focused {
+        log.info("old session was focused — leaving window normal");
+    } else if win32::is_minimized(w.hwnd) {
         log.info("window already minimized");
     } else {
         win32::minimize(w.hwnd);
