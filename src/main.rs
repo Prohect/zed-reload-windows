@@ -30,8 +30,11 @@
 //! * `Enter` sends the message, unless the user's `settings.json` has
 //!   `"use_modifier_to_send": true` — then `Ctrl+Enter` is required.
 //!   Auto-detected; override with `--send-enter` / `--send-ctrl-enter`.
-//! * `restore_on_startup` defaults to `last_session`, so a bare relaunch
-//!   reopens the previous workspace including the Agent Panel.
+//! * The worker reopens the *calling* project path (the launcher's cwd),
+//!   not whatever session-restore puts in front.  With several projects
+//!   open, session restore may bring a different window to the front than
+//!   the one the agent invoked zed-reload from, so recovery would land in
+//!   the wrong session.
 //!
 //! # Why `explorer.exe`?
 //!
@@ -106,7 +109,8 @@ struct Args {
 
     // ── misc ──────────────────────────────────────────────────────
 
-    /// Open this project path instead of relying on session restore.
+    /// Project path to reopen (default: the current working directory, so
+    /// the restarted session is the one that invoked zed-reload).
     #[arg(long)]
     project: Option<String>,
 
@@ -211,7 +215,18 @@ fn run_launcher(args: &Args) {
         args.window_timeout,
         args.heads_up,
     );
-    if let Some(p) = &args.project {
+    // The restarted Zed must land in *this* session's project.  Zed's
+    // default `restore_on_startup = last_session` may bring a different
+    // window to the front when several projects are open, so the
+    // reload-recovery-continue flow would resume the wrong session.
+    // Pass the calling project ($pwd) explicitly; --project overrides.
+    let project = match &args.project {
+        Some(p) => Some(p.clone()),
+        None => env::current_dir()
+            .map(|d| d.to_string_lossy().into_owned())
+            .ok(),
+    };
+    if let Some(p) = &project {
         cmdline.push_str(&format!(" --project \"{p}\""));
     }
     if let Some(t) = &args.window_title {
@@ -253,6 +268,10 @@ fn run_launcher(args: &Args) {
                 args.settle,
                 args.heads_up,
             );
+            match &project {
+                Some(p) => println!("zed-reload: project -> {p}"),
+                None => println!("zed-reload: project -> (session restore)"),
+            }
             println!("zed-reload: log -> {}", log.path().display());
         }
         Err(e) => {
@@ -300,15 +319,23 @@ fn run_worker(args: &Args) -> i32 {
     zed::stop(&log, args.grace);
 
     let ok = match zed::start(&log, &args.zed_path, &args.project) {
-        Ok(()) => work::inject(
-            &log,
-            &message,
-            args.window_timeout,
-            args.settle,
-            args.heads_up,
-            &args.window_title,
-            args.send_key(),
-        ),
+        Ok(lnk) => {
+            let ok = work::inject(
+                &log,
+                &message,
+                args.window_timeout,
+                args.settle,
+                args.heads_up,
+                &args.window_title,
+                args.send_key(),
+            );
+            // The launch is confirmed (or failed) by now; explorer has
+            // parsed the shortcut long ago, so it can be removed.
+            if let Some(p) = lnk {
+                let _ = fs::remove_file(p);
+            }
+            ok
+        }
         Err(e) => {
             log.error(&format!("{e}"));
             false

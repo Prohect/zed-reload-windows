@@ -295,27 +295,59 @@ pub fn stop(log: &Log, grace_secs: u64) {
 /// which causes its terminal-shell auto-detection to fall back to PowerShell
 /// instead of the user's preferred shell.  Using `explorer.exe` mimics a
 /// normal desktop launch.
+///
+/// With a project path, a plain `explorer.exe "Zed.exe" "path"` command line
+/// does not work: explorer mangles multi-argument command lines into one path
+/// and launches nothing.  The project is therefore carried in a temporary
+/// `.lnk` shortcut (target + arguments + working directory in one file) that
+/// explorer opens as a single argument.
+///
+/// Returns the temporary shortcut path when one was used; the caller removes
+/// it once the launch has been confirmed (the worker lives long enough).
 pub fn start(
     log: &Log,
     override_path: &Option<String>,
     project: &Option<String>,
-) -> Result<(), String> {
+) -> Result<Option<PathBuf>, String> {
     let exe = find_exe(override_path).ok_or("Zed.exe not found")?;
-    let cmdline = match project {
-        Some(p) => format!("explorer.exe \"{}\" \"{}\"", exe.display(), p),
-        None => format!("explorer.exe \"{}\"", exe.display()),
-    };
-    log.info(&format!(
-        "starting {} via explorer.exe {}",
-        exe.display(),
-        if project.is_some() {
-            format!("project='{}'", project.as_ref().unwrap())
-        } else {
-            "(bare, session restore)".to_string()
+    match project {
+        Some(p) => {
+            // Remove shortcuts left behind by interrupted runs.
+            if let Ok(rd) = fs::read_dir(env::temp_dir()) {
+                for entry in rd.flatten() {
+                    let file_name = entry.file_name();
+                    let name = file_name.to_string_lossy();
+                    if name.starts_with("zed-reload-") && name.ends_with(".lnk") {
+                        let _ = fs::remove_file(entry.path());
+                    }
+                }
+            }
+
+            let lnk = env::temp_dir().join(format!("zed-reload-{}.lnk", std::process::id()));
+            if let Err(e) = win32::write_shortcut(&exe, &format!("\"{p}\""), p, &lnk) {
+                let _ = fs::remove_file(&lnk);
+                return Err(e);
+            }
+            log.info(&format!(
+                "starting {} via explorer shortcut project='{p}'",
+                exe.display(),
+            ));
+            win32::spawn(
+                &format!("explorer.exe \"{}\"", lnk.display()),
+                CREATE_NEW_PROCESS_GROUP,
+            )?;
+            Ok(Some(lnk))
         }
-    ));
-    win32::spawn(&cmdline, CREATE_NEW_PROCESS_GROUP)?;
-    Ok(())
+        None => {
+            let cmdline = format!("explorer.exe \"{}\"", exe.display());
+            log.info(&format!(
+                "starting {} via explorer.exe (bare, session restore)",
+                exe.display(),
+            ));
+            win32::spawn(&cmdline, CREATE_NEW_PROCESS_GROUP)?;
+            Ok(None)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
