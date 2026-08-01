@@ -291,16 +291,22 @@ pub fn stop(log: &Log, grace_secs: u64) {
 
 /// Launch Zed through `explorer.exe` so Zed's parent is the desktop shell.
 ///
-/// A direct `CreateProcessW` spawn puts Zed under a console-process ancestry,
-/// which causes its terminal-shell auto-detection to fall back to PowerShell
-/// instead of the user's preferred shell.  Using `explorer.exe` mimics a
-/// normal desktop launch.
+/// A direct `CreateProcessW` spawn puts Zed under a console-process ancestry
+/// (the detached worker's own ancestry contains the launcher's console),
+/// which makes its terminal-shell auto-detection fall back to PowerShell
+/// instead of the user's preferred shell — verified empirically.
+/// `explorer.exe` gives Zed the standard desktop parent.
 ///
 /// With a project path, a plain `explorer.exe "Zed.exe" "path"` command line
 /// does not work: explorer mangles multi-argument command lines into one path
 /// and launches nothing.  The project is therefore carried in a temporary
 /// `.lnk` shortcut (target + arguments + working directory in one file) that
 /// explorer opens as a single argument.
+///
+/// The window is NOT minimized at launch (explorer delivers
+/// `SW_SHOWDEFAULT` regardless of the shortcut's show state, Zed rejects CLI
+/// flags, and gpui ignores `STARTUPINFO.wShowWindow`); the worker minimizes
+/// it as soon as it appears instead — see `work::inject`.
 ///
 /// Returns the temporary shortcut path when one was used; the caller removes
 /// it once the launch has been confirmed (the worker lives long enough).
@@ -324,10 +330,6 @@ pub fn start(
             }
 
             let lnk = env::temp_dir().join(format!("zed-reload-{}.lnk", std::process::id()));
-            // Minimized launch rides on the shortcut's "Run: Minimized"
-            // (SW_SHOWMINIMIZED in STARTUPINFO), which gpui_windows honors —
-            // so the restart does not steal focus.  No CLI flag: Zed rejects
-            // unknown arguments.
             if let Err(e) = win32::write_shortcut(&exe, &format!("\"{p}\""), p, &lnk) {
                 let _ = fs::remove_file(&lnk);
                 return Err(e);

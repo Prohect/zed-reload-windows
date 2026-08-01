@@ -14,8 +14,10 @@
 //! **Worker** (the detached process):
 //!   1. Reads the message from the temp file (deletes it after).
 //!   2. Waits `--wait` seconds.
-//!   3. Stops Zed, starts it via `explorer.exe` (best-effort minimized
-//!      start via the shortcut; explorer may deliver a normal window).
+//!   3. Stops Zed, starts it via `explorer.exe` (desktop parent — keeps the
+//!      terminal-shell auto-detection on the user's shell; direct spawns
+//!      regress it to PowerShell).  The worker minimizes the Zed window as
+//!      soon as it appears, so the launch cannot hold focus.
 //!   4. Single-focus injection:
 //!      a. **Windows notification** — a tray balloon warns the user
 //!         ("stop typing, something is about to happen"); unlike a focus
@@ -41,17 +43,25 @@
 //!   with the project folder name) — recovery is strictly the agent that
 //!   invoked zed-reload; no match means no injection.
 //!
+//! # Minimized start
+//!
+//! The relaunched Zed window cannot be *created* minimized from outside:
+//! explorer delivers `SW_SHOWDEFAULT` regardless of the shortcut's
+//! "Run: Minimized" (verified by the delivery test), Zed rejects unknown
+//! CLI flags (e.g. `--minimized`), and gpui ignores
+//! `STARTUPINFO.wShowWindow` (verified: a direct spawn with
+//! `SW_SHOWMINIMIZED` still opened a normal window).  The worker therefore
+//! minimizes the window the moment it appears — a brief flash to the front
+//! is unavoidable — and the injection focus restores it via `SW_RESTORE`.
+//!
 //! # Why `explorer.exe`?
 //!
-//! Spawning Zed directly leaves it under a console-process ancestry, which
-//! tricks its terminal-shell auto-detection into falling back to PowerShell.
-//! Launching through `explorer.exe` gives it the standard desktop-shell parent
-//! so it auto-detects the user's preferred shell correctly.  The launch
-//! shortcut carries "Run: Minimized" as best-effort — explorer does not
-//! deliver it via `explorer.exe "file.lnk"` (SW_SHOWDEFAULT arrives
-//! instead), so the flow must cope with a normal (focus-stealing) start;
-//! `force_foreground` restores a minimized window via `SW_RESTORE`.
-//! Zed is never passed CLI flags — it rejects unknown arguments.
+//! Spawning Zed directly (even from the detached, console-less worker)
+//! leaves it under a console-process ancestry, which tricks its
+//! terminal-shell auto-detection into falling back to PowerShell instead of
+//! the user's preferred shell — verified empirically.  Launching through
+//! `explorer.exe` gives it the standard desktop-shell parent so it
+//! auto-detects the shell correctly.
 
 mod log;
 mod win32;

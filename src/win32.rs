@@ -256,13 +256,15 @@ pub fn startup_show_cmd() -> u16 {
 
 // ---------------------------------------------------------------------------
 // .lnk shortcut writing (IShellLinkW / IPersistFile, raw vtables)
-// ---------------------------------------------------------------------------
 //
 // `explorer.exe` mangles multi-argument command lines (it joins the
 // arguments into a single path and silently launches nothing), so a project
 // launch must pass target + arguments as a single explorer argument: a
-// temporary .lnk shortcut.  windows-sys does not generate COM interface
-// definitions, so the vtables are declared by hand.
+// temporary .lnk shortcut.  The shortcut's "Run: Minimized" is NOT honored
+// by explorer (it delivers SW_SHOWDEFAULT — see
+// `shortcut_delivers_show_cmd_and_workdir`); the worker minimizes the Zed
+// window after it appears instead.  windows-sys does not generate COM
+// interface definitions, so the vtables are declared by hand.
 
 const CLSID_SHELL_LINK: GUID = GUID::from_u128(0x00021401_0000_0000_c000_000000000046);
 const IID_ISHELLLINKW: GUID = GUID::from_u128(0x000214F9_0000_0000_c000_000000000046);
@@ -360,16 +362,6 @@ pub fn write_shortcut(
                 return Err(format!(
                     "IShellLink::SetWorkingDirectory failed, HRESULT={hr:#010x}"
                 ));
-            }
-            // "Run: Minimized" — best effort: explorer delivers this as
-            // `STARTUPINFO.wShowWindow` for some launch paths, but NOT via
-            // `explorer.exe "file.lnk"` (verified: arrives as SW_SHOWDEFAULT
-            // here).  Kept anyway; the injection flow handles both minimized
-            // and normal windows.  No CLI flag is used — Zed rejects unknown
-            // arguments.
-            let hr = (link_vtbl.set_show_cmd)(link_raw, SW_SHOWMINIMIZED);
-            if hr != 0 {
-                return Err(format!("IShellLink::SetShowCmd failed, HRESULT={hr:#010x}"));
             }
 
             let mut persist_raw: *mut core::ffi::c_void = std::ptr::null_mut();
@@ -634,6 +626,18 @@ pub fn spawn(cmdline: &str, flags: u32) -> Result<u32, String> {
         let _ = CloseHandle(pi.hProcess);
         let _ = CloseHandle(pi.hThread);
         Ok(pi.dwProcessId)
+    }
+}
+
+/// True if `hwnd` is minimized (iconic).
+pub fn is_minimized(hwnd: HWND) -> bool {
+    unsafe { IsIconic(hwnd) == TRUE }
+}
+
+/// Minimize `hwnd` (no-op if already minimized).
+pub fn minimize(hwnd: HWND) {
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_MINIMIZE);
     }
 }
 

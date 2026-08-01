@@ -45,6 +45,17 @@ pub fn inject(
         "window found pid={} title='{}'; settling {settle_secs}s",
         w.pid, w.title,
     ));
+    // Minimize the window as soon as it appears: the launch cannot create
+    // it minimized (explorer delivers SW_SHOWDEFAULT, Zed rejects CLI
+    // flags, gpui ignores STARTUPINFO.wShowWindow), so this is the only
+    // way to keep it from holding focus during the settle.  The injection
+    // focus restores it (SW_RESTORE).
+    if win32::is_minimized(w.hwnd) {
+        log.info("window already minimized");
+    } else {
+        win32::minimize(w.hwnd);
+        log.info("window minimized (launch focus-safe)");
+    }
     sleep(Duration::from_secs(settle_secs));
 
     // ── heads-up: Windows notification (never steals focus) ────────
