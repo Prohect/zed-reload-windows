@@ -16,9 +16,11 @@ use windows_sys::Win32::System::DataExchange::*;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
 use windows_sys::Win32::System::Memory::*;
 use windows_sys::Win32::System::LibraryLoader::*;
+use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
 use windows_sys::Win32::System::Threading::{
-    AttachThreadInput, CreateProcessW, GetCurrentThreadId, GetStartupInfoW, OpenProcess,
-    TerminateProcess, PROCESS_INFORMATION, PROCESS_TERMINATE, STARTUPINFOW,
+    AttachThreadInput, CreateProcessW, GetCurrentThreadId, GetProcessTimes, GetStartupInfoW,
+    OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, STARTUPINFOW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -64,6 +66,81 @@ pub fn find_pids(name: &str) -> Vec<u32> {
         let _ = CloseHandle(snap);
     }
     pids
+}
+
+/// Parent PID of `pid` (`None` when the process is gone).
+pub fn parent_pid(pid: u32) -> Option<u32> {
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE || snap.is_null() {
+            return None;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut parent = None;
+        if Process32FirstW(snap, &mut entry) == TRUE {
+            loop {
+                if entry.th32ProcessID == pid {
+                    parent = Some(entry.th32ParentProcessID);
+                    break;
+                }
+                if Process32NextW(snap, &mut entry) != TRUE {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+        parent
+    }
+}
+
+/// Full executable path of a process (e.g. `C:\...\Zed.exe`), or `None`
+/// when the process cannot be opened.
+pub fn exe_path(pid: u32) -> Option<String> {
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if h.is_null() {
+            return None;
+        }
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
+        let _ = CloseHandle(h);
+        if ok == FALSE {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&buf[..len as usize]))
+    }
+}
+
+/// Current time as FILETIME ticks (100 ns since 1601-01-01 UTC).
+pub fn now_filetime() -> u64 {
+    unsafe {
+        let mut ft: FILETIME = std::mem::zeroed();
+        GetSystemTimeAsFileTime(&mut ft);
+        ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64
+    }
+}
+
+/// Creation time of a process as FILETIME ticks (same clock as
+/// `now_filetime`), or `None` when the process cannot be opened.
+pub fn start_time(pid: u32) -> Option<u64> {
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if h.is_null() {
+            return None;
+        }
+        let mut creation: FILETIME = std::mem::zeroed();
+        let mut exit: FILETIME = std::mem::zeroed();
+        let mut kernel: FILETIME = std::mem::zeroed();
+        let mut user: FILETIME = std::mem::zeroed();
+        let ok = GetProcessTimes(h, &mut creation, &mut exit, &mut kernel, &mut user);
+        let _ = CloseHandle(h);
+        if ok == FALSE {
+            return None;
+        }
+        Some(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
+    }
 }
 
 // ---------------------------------------------------------------------------

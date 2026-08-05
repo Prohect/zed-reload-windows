@@ -10,6 +10,7 @@
 //! 4. **Single focus** — bring Zed to the foreground (restoring it from
 //!    the minimized launch), then inject.
 
+use std::path::Path;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -34,12 +35,15 @@ pub fn inject(
     heads_up_secs: u64,
     window_title: &Option<String>,
     project: &Option<String>,
+    exe: &Path,
+    not_before: u64,
     old_was_focused: bool,
     send_key: Option<bool>, // Some(true)=ctrl+enter, Some(false)=enter
 ) -> bool {
     // ── wait for the new Zed window ────────────────────────────────
 
-    let Some(w) = zed::wait_for_window(project, window_title, window_timeout, log) else {
+    let Some(w) = zed::wait_for_window(project, window_title, window_timeout, log, exe, not_before)
+    else {
         return false;
     };
     log.info(&format!(

@@ -6,19 +6,25 @@
 //!
 //! **Launcher** (the process the user invokes):
 //!   1. Writes the message to a temp file.
-//!   2. Re-spawns itself detached (`DETACHED_PROCESS | CREATE_NO_WINDOW |
-//!      CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB`) with `--worker`
-//!      and `--message-file`.
-//!   3. Prints the worker PID + log path and exits immediately.
+//!   2. Resolves the running Zed's exe path — the closest Zed *ancestor* —
+//!      so the worker restarts the same variant (Release, Preview, Nightly,
+//!      dev).  Several running Zeds without an ancestor is ambiguous: the
+//!      launcher aborts and asks for `--zed-path`.
+//!   3. Re-spawns itself detached (`DETACHED_PROCESS | CREATE_NO_WINDOW |
+//!      CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB`) with
+//!      `--worker`, `--message-file` and `--zed-path`.
+//!   4. Prints the worker PID + log path and exits immediately.
 //!
 //! **Worker** (the detached process):
 //!   1. Reads the message from the temp file (deletes it after).
 //!   2. Waits `--wait` seconds.
-//!   3. Stops Zed, starts it via `explorer.exe` (desktop parent — keeps the
-//!      terminal-shell auto-detection on the user's shell; direct spawns
-//!      regress it to PowerShell).  If the old session was not focused the
-//!      worker minimizes the new window as soon as it appears, so the
-//!      launch cannot hold focus.
+//!   3. Stops only the target Zed process (`--zed-pid`; default: the
+//!      invoking ancestor — other Zed processes, same variant included,
+//!      keep running), then starts the resolved exe via `explorer.exe`
+//!      (desktop parent — keeps the terminal-shell auto-detection on the
+//!      user's shell; direct spawns regress it to PowerShell).  If the old
+//!      session was not focused the worker minimizes the new window as
+//!      soon as it appears, so the launch cannot hold focus.
 //!   4. Single-focus injection:
 //!      a. **Windows notification** — a tray balloon warns the user
 //!         ("stop typing, something is about to happen"); unlike a focus
@@ -145,9 +151,15 @@ struct Args {
     #[arg(long)]
     window_title: Option<String>,
 
-    /// Explicit path to Zed.exe.
+    /// Explicit path to Zed.exe (what to start; default: the target
+    /// process's own exe).
     #[arg(long)]
     zed_path: Option<String>,
+
+    /// Only stop this Zed process (default: the closest Zed ancestor).
+    /// Other Zed processes — same variant included — keep running.
+    #[arg(long)]
+    zed_pid: Option<u32>,
 
     /// Force-send with Enter (override auto-detect).
     #[arg(long, group = "send_key")]
@@ -226,6 +238,20 @@ fn main() {
 fn run_launcher(args: &Args) {
     let message = args.message();
 
+    // Restart the *same* Zed instance that invoked us: the closest Zed
+    // ancestor is the target — only that process is stopped (other Zeds,
+    // same variant included, keep running) and its own exe is what gets
+    // started again (Release, Preview, Nightly, or a dev build).  Must be
+    // resolved here in the launcher — by the time the worker acts, the
+    // target may already be dead.  Without a Zed ancestor, several running
+    // Zeds are ambiguous -> hard error (unless --zed-path/--zed-pid was
+    // given).  No running Zed at all -> the worker's on-disk search starts
+    // one; nothing is stopped.
+    let target = zed::resolve_target(&args.zed_path, args.zed_pid).unwrap_or_else(|e| {
+        eprintln!("zed-reload: {e}");
+        exit(2);
+    });
+
     // Write to a unique temp file so the message survives re-parsing.
     let msg_file = env::temp_dir().join(format!(
         "zed-reload-{}-{}.msg",
@@ -274,8 +300,11 @@ fn run_launcher(args: &Args) {
     if let Some(t) = &args.window_title {
         cmdline.push_str(&format!(" --window-title \"{t}\""));
     }
-    if let Some(z) = &args.zed_path {
-        cmdline.push_str(&format!(" --zed-path \"{z}\""));
+    if let Some(t) = &target {
+        cmdline.push_str(&format!(" --zed-path \"{}\"", t.exe.display()));
+        if let Some(pid) = t.pid {
+            cmdline.push_str(&format!(" --zed-pid {pid}"));
+        }
     }
     if args.send_enter {
         cmdline.push_str(" --send-enter");
@@ -313,6 +342,16 @@ fn run_launcher(args: &Args) {
             match &project {
                 Some(p) => println!("zed-reload: project -> {p}"),
                 None => println!("zed-reload: project -> (session restore)"),
+            }
+            match &target {
+                Some(t) => {
+                    println!("zed-reload: zed exe  -> {}", t.exe.display());
+                    match t.pid {
+                        Some(pid) => println!("zed-reload: target   -> pid {pid}"),
+                        None => println!("zed-reload: target   -> (none — start only)"),
+                    }
+                }
+                None => println!("zed-reload: zed exe  -> (on-disk search)"),
             }
             println!("zed-reload: log -> {}", log.path().display());
         }
@@ -356,11 +395,22 @@ fn run_worker(args: &Args) -> i32 {
         args.heads_up,
     ));
 
+    // Resolve the exe up front (fail fast): the worker stops only the
+    // target process (`--zed-pid`) and starts this exe.
+    let Some(exe) = zed::find_exe(&args.zed_path) else {
+        log.error("Zed.exe not found");
+        return 2;
+    };
+
     sleep(Duration::from_secs(args.wait));
 
-    let was_focused = zed::stop(&log, args.grace);
+    let was_focused = zed::stop(&log, args.grace, args.zed_pid);
 
-    let ok = match zed::start(&log, &args.zed_path, &args.project) {
+    // The new process is identified by its creation time: anything started
+    // after this instant cannot be a survivor of the old session(s).
+    let launch_after = win32::now_filetime();
+
+    let ok = match zed::start(&log, &exe, &args.project) {
         Ok(lnk) => {
             let ok = work::inject(
                 &log,
@@ -370,6 +420,8 @@ fn run_worker(args: &Args) -> i32 {
                 args.heads_up,
                 &args.window_title,
                 &args.project,
+                &exe,
+                launch_after,
                 was_focused,
                 args.send_key(),
             );
@@ -407,6 +459,17 @@ fn run_check(args: &Args) -> i32 {
     match &exe_path {
         Some(p) => println!("  zed exe    : {}", p.display()),
         None => println!("  zed exe    : NOT FOUND"),
+    }
+    match zed::resolve_target(&args.zed_path, args.zed_pid) {
+        Ok(Some(t)) => {
+            println!("  zed running: {}", t.exe.display());
+            match t.pid {
+                Some(pid) => println!("  zed target : pid {pid}"),
+                None => println!("  zed target : (stop nothing)"),
+            }
+        }
+        Ok(None) => println!("  zed running: (none)"),
+        Err(e) => println!("  zed running: AMBIGUOUS — {e}"),
     }
 
     let wins = zed::windows();

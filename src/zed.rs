@@ -25,8 +25,9 @@ use crate::win32::{self, Window};
 /// Search order:
 /// 1. `override_path` (if given and exists)
 /// 2. `%LOCALAPPDATA%\Programs\Zed Nightly\Zed.exe`
-/// 3. `%LOCALAPPDATA%\Programs\Zed\Zed.exe`
-/// 4. Every directory on `%PATH%` (first match wins)
+/// 3. `%LOCALAPPDATA%\Programs\Zed Preview\Zed.exe`
+/// 4. `%LOCALAPPDATA%\Programs\Zed\Zed.exe`
+/// 5. Every directory on `%PATH%` (first match wins)
 pub fn find_exe(override_path: &Option<String>) -> Option<PathBuf> {
     if let Some(p) = override_path {
         let path = Path::new(p);
@@ -37,6 +38,7 @@ pub fn find_exe(override_path: &Option<String>) -> Option<PathBuf> {
     if let Ok(local) = env::var("LOCALAPPDATA") {
         for sub in [
             r"Programs\Zed Nightly\Zed.exe",
+            r"Programs\Zed Preview\Zed.exe",
             r"Programs\Zed\Zed.exe",
         ] {
             let p = PathBuf::from(&local).join(sub);
@@ -59,6 +61,105 @@ pub fn find_exe(override_path: &Option<String>) -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
+// target resolution
+// ---------------------------------------------------------------------------
+
+/// The Zed instance to restart: which process to stop (`pid`) and which
+/// binary to start (`exe`).  Kept separate on purpose — several independent
+/// Zed processes can share one exe path, so the exe identifies the binary,
+/// never the set of processes to end.
+pub struct Target {
+    pub exe: PathBuf,
+    pub pid: Option<u32>,
+}
+
+/// The closest Zed *ancestor* of this process: `(pid, exe path)`.
+/// zed-reload is normally invoked from Zed's terminal or agent panel, so
+/// the nearest `zed.exe` up the parent chain is the instance to restart.
+fn zed_ancestor() -> Option<(u32, PathBuf)> {
+    let mut pid = std::process::id();
+    // Depth cap guards against parent-PID loops (reused PIDs).
+    for _ in 0..32 {
+        let Some(parent) = win32::parent_pid(pid) else { break };
+        if parent == pid {
+            break;
+        }
+        if let Some(path) = win32::exe_path(parent) {
+            if Path::new(&path)
+                .file_name()
+                .map_or(false, |n| n.to_string_lossy().eq_ignore_ascii_case("zed.exe"))
+            {
+                return Some((parent, PathBuf::from(path)));
+            }
+        }
+        pid = parent;
+    }
+    None
+}
+
+/// Resolve the restart target from the live system state.
+///
+/// * `pid` — `override_pid`, else the closest Zed ancestor, else the only
+///   running `zed.exe`.  `None` means "stop nothing".
+/// * `exe` — `override_path`, else the target process's image path (the
+///   exact variant: Release, Preview, Nightly, or a dev build).  Preferred
+///   over the on-disk search in `find_exe`, which cannot see dev builds.
+///
+/// Several running Zeds with no identifiable target is an error — unless
+/// the exe was given explicitly: then the start is unambiguous and nothing
+/// is stopped.
+pub fn resolve_target(
+    override_path: &Option<String>,
+    override_pid: Option<u32>,
+) -> Result<Option<Target>, String> {
+    if let Some(pid) = override_pid {
+        let exe = match override_path {
+            Some(z) => PathBuf::from(z),
+            None => {
+                let path = win32::exe_path(pid)
+                    .ok_or_else(|| format!("cannot query exe path of pid {pid}"))?;
+                let is_zed = Path::new(&path)
+                    .file_name()
+                    .map_or(false, |n| n.to_string_lossy().eq_ignore_ascii_case("zed.exe"));
+                if !is_zed {
+                    return Err(format!("pid {pid} is not a Zed process ({path})"));
+                }
+                PathBuf::from(path)
+            }
+        };
+        return Ok(Some(Target { exe, pid: Some(pid) }));
+    }
+    if let Some((pid, path)) = zed_ancestor() {
+        let exe = override_path.as_ref().map_or(path, PathBuf::from);
+        return Ok(Some(Target { exe, pid: Some(pid) }));
+    }
+    let running: Vec<(u32, String)> = win32::find_pids("zed.exe")
+        .iter()
+        .filter_map(|&pid| win32::exe_path(pid).map(|p| (pid, p)))
+        .collect();
+    match running.len() {
+        0 => Ok(None),
+        1 => {
+            let (pid, path) = running.into_iter().next().unwrap();
+            let exe = override_path.as_ref().map_or(PathBuf::from(path), PathBuf::from);
+            Ok(Some(Target { exe, pid: Some(pid) }))
+        }
+        _ => match override_path {
+            Some(z) => Ok(Some(Target { exe: PathBuf::from(z), pid: None })),
+            None => Err(format!(
+                "no Zed ancestor and several Zed processes are running — cannot \
+                 tell which to restart (pass --zed-pid or --zed-path):\n  {}",
+                running
+                    .iter()
+                    .map(|(pid, p)| format!("pid {pid}: {p}"))
+                    .collect::<Vec<_>>()
+                    .join("\n  "),
+            )),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // windows
 // ---------------------------------------------------------------------------
 
@@ -66,6 +167,26 @@ pub fn find_exe(override_path: &Option<String>) -> Option<PathBuf> {
 /// Prefers windows with a non-empty title.
 pub fn windows() -> Vec<Window> {
     let pids = win32::find_pids("zed.exe");
+    if pids.is_empty() {
+        return Vec::new();
+    }
+    win32::enum_windows(&pids)
+}
+
+/// PIDs of running `zed.exe` processes whose image path is `exe`
+/// (case-insensitive).  Processes whose path cannot be queried are
+/// excluded — never touch what cannot be identified.
+fn pids_for(exe: &Path) -> Vec<u32> {
+    let target = exe.to_string_lossy().into_owned();
+    win32::find_pids("zed.exe")
+        .into_iter()
+        .filter(|&pid| win32::exe_path(pid).map_or(false, |p| p.eq_ignore_ascii_case(&target)))
+        .collect()
+}
+
+/// Visible top-level windows belonging to Zed processes running `exe`.
+pub fn windows_for(exe: &Path) -> Vec<Window> {
+    let pids = pids_for(exe);
     if pids.is_empty() {
         return Vec::new();
     }
@@ -255,20 +376,30 @@ fn key_to_vk(name: &str) -> Option<u16> {
 // stop
 // ---------------------------------------------------------------------------
 
-/// Gracefully close all Zed windows (`WM_CLOSE`), then force-kill any
-/// remaining processes after `grace_secs`.
+/// Gracefully close the *target* Zed process (`WM_CLOSE` to its windows),
+/// then force-kill it after `grace_secs` if it is still running.
 ///
-/// Returns whether a Zed window was the foreground window when the stop
-/// began — the caller guards the minimized relaunch on this: if the user
-/// was in Zed, the new window appearing normally is expected; if they were
-/// elsewhere, their focus is protected by minimizing the new window.
-pub fn stop(log: &Log, grace_secs: u64) -> bool {
-    let wins = windows();
+/// Only the target is touched: other Zed processes — including independent
+/// processes of the same variant — keep running.  The target is verified
+/// to still be a `zed.exe` process first (guard against PID reuse during
+/// the wait); `None` means "nothing to stop".
+///
+/// Returns whether the target's window was the foreground window when the
+/// stop began — the caller guards the minimized relaunch on this: if the
+/// user was in Zed, the new window appearing normally is expected; if they
+/// were elsewhere, their focus is protected by minimizing the new window.
+pub fn stop(log: &Log, grace_secs: u64, target: Option<u32>) -> bool {
+    let alive = |pid: u32| win32::find_pids("zed.exe").contains(&pid);
+    let Some(pid) = target.filter(|&pid| alive(pid)) else {
+        log.info("no live target Zed process — nothing to stop");
+        return false;
+    };
+    let wins = win32::enum_windows(&[pid]);
     // Capture focus before closing anything: after WM_CLOSE the
     // foreground moves to whatever was behind.
     let was_focused = wins.iter().any(|w| win32::get_foreground() == w.hwnd);
     if wins.is_empty() {
-        log.info("no Zed window to close");
+        log.info("target has no visible window to close");
     }
     for w in &wins {
         log.info(&format!("WM_CLOSE pid={} title='{}'", w.pid, w.title));
@@ -279,18 +410,16 @@ pub fn stop(log: &Log, grace_secs: u64) -> bool {
     let deadline = Instant::now() + Duration::from_secs(grace_secs);
     while Instant::now() < deadline {
         sleep(Duration::from_millis(500));
-        if win32::find_pids("zed.exe").is_empty() {
+        if !alive(pid) {
             log.info("Zed exited gracefully");
             return was_focused;
         }
     }
 
     log.info(&format!(
-        "graceful close timed out after {grace_secs}s — force killing"
+        "graceful close timed out after {grace_secs}s — force killing pid {pid}"
     ));
-    for pid in win32::find_pids("zed.exe") {
-        win32::kill(pid);
-    }
+    win32::kill(pid);
     sleep(Duration::from_secs(2));
     was_focused
 }
@@ -322,10 +451,9 @@ pub fn stop(log: &Log, grace_secs: u64) -> bool {
 /// it once the launch has been confirmed (the worker lives long enough).
 pub fn start(
     log: &Log,
-    override_path: &Option<String>,
+    exe: &Path,
     project: &Option<String>,
 ) -> Result<Option<PathBuf>, String> {
-    let exe = find_exe(override_path).ok_or("Zed.exe not found")?;
     match project {
         Some(p) => {
             // Remove shortcuts left behind by interrupted runs.
@@ -382,7 +510,13 @@ fn title_filter(project: &Option<String>, window_title: &Option<String>) -> Opti
     }
 }
 
-/// Block until a visible Zed window appears (up to `timeout_secs`).
+/// Block until a window of the *newly started* Zed appears (up to
+/// `timeout_secs`).
+///
+/// Only windows of processes running `exe` that were *created at or after*
+/// `not_before` (captured just before the launch) qualify — a surviving
+/// process of the same or another variant can hold an equally-titled
+/// window, and the injection must never land there.
 ///
 /// The window is matched against `window_title` (explicit substring filter)
 /// or, failing that, against the project's folder name — Zed titles windows
@@ -397,6 +531,8 @@ pub fn wait_for_window(
     window_title: &Option<String>,
     timeout_secs: u64,
     log: &Log,
+    exe: &Path,
+    not_before: u64,
 ) -> Option<Window> {
     let filter = title_filter(project, window_title);
     if let Some(f) = &filter {
@@ -404,7 +540,10 @@ pub fn wait_for_window(
     }
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     while Instant::now() < deadline {
-        let wins = windows();
+        let wins: Vec<Window> = windows_for(exe)
+            .into_iter()
+            .filter(|w| win32::start_time(w.pid).map_or(false, |t| t >= not_before))
+            .collect();
         let filtered: Vec<&Window> = match &filter {
             Some(sub) => {
                 let sub = sub.to_lowercase();
