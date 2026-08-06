@@ -9,12 +9,16 @@
 //!    activity that could break the keystroke injection.
 //! 4. **Single focus** — bring Zed to the foreground (restoring it from
 //!    the minimized launch), then inject.
+//!
+//! The exact keystrokes (toggle binding, quick-paste binding, send key)
+//! come from the launcher's resolved plan — see [`InjectKeys`] — so the
+//! worker never re-reads the user's config.
 
 use std::path::Path;
 use std::thread::sleep;
 use std::time::Duration;
 
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_LCONTROL, VK_RETURN, VK_V};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_LCONTROL, VK_RETURN};
 
 use crate::log::Log;
 use crate::win32;
@@ -23,6 +27,18 @@ use crate::zed;
 // ---------------------------------------------------------------------------
 // inject
 // ---------------------------------------------------------------------------
+
+/// The keystrokes the injection needs, fully resolved by the launcher.
+pub struct InjectKeys {
+    /// Send with Ctrl+Enter instead of Enter.
+    pub ctrl_enter: bool,
+    /// `agent::ToggleFocus` binding (the user's custom binding if any).
+    pub toggle: Vec<u16>,
+    /// Paste binding, pressed in Normal mode: `ctrl-v` normally;
+    /// `shift-insert` in Vim; `shift-r` in Helix (the fork's quick-paste
+    /// keys — both read the Windows clipboard via `editor::Paste`).
+    pub paste: Vec<u16>,
+}
 
 /// Inject `message` into the Agent Panel.
 ///
@@ -38,7 +54,7 @@ pub fn inject(
     exe: &Path,
     not_before: u64,
     old_was_focused: bool,
-    send_key: Option<bool>, // Some(true)=ctrl+enter, Some(false)=enter
+    keys: &InjectKeys,
 ) -> bool {
     // ── wait for the new Zed window ────────────────────────────────
 
@@ -99,7 +115,7 @@ pub fn inject(
 
     // ── keystroke injection ────────────────────────────────────────
 
-    let ctrl_enter = send_key.unwrap_or_else(zed::detect_ctrl_enter);
+    let ctrl_enter = keys.ctrl_enter;
     log.info(&format!(
         "send key: {}",
         if ctrl_enter { "ctrl+enter" } else { "enter" },
@@ -112,13 +128,13 @@ pub fn inject(
             return false;
         }
         // Toggle agent panel focus (use the user's custom binding if any).
-        let toggle_keys = zed::detect_toggle_binding();
-        log.info(&format!("sending agent::ToggleFocus  ({:?})", toggle_keys));
-        win32::send_combo(&toggle_keys);
+        log.info(&format!("sending agent::ToggleFocus  ({:?})", keys.toggle));
+        win32::send_combo(&keys.toggle);
         sleep(Duration::from_millis(1600));
-        // Paste.
-        log.info("sending ctrl+v  (paste)");
-        win32::send_combo(&[VK_LCONTROL, VK_V]);
+        // Paste — in Normal mode: Vim/Helix quick-paste keys read the
+        // Windows clipboard directly, no insert-mode detour needed.
+        log.info(&format!("sending paste  ({:?})", keys.paste));
+        win32::send_combo(&keys.paste);
         sleep(Duration::from_millis(900));
         // Send.
         if ctrl_enter {
@@ -137,6 +153,12 @@ pub fn inject(
     if let Some(old) = old_clip {
         sleep(Duration::from_millis(400));
         let _ = win32::clipboard_set(&old);
+    }
+    // The user was not in Zed: the launch and injection already took focus
+    // once — put the window away again so they don't keep it.
+    if !old_was_focused {
+        win32::minimize(w.hwnd);
+        log.info("window minimized (injection done — user was elsewhere)");
     }
     ok
 }

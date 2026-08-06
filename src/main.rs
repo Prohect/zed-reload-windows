@@ -10,10 +10,15 @@
 //!      so the worker restarts the same variant (Release, Preview, Nightly,
 //!      dev).  Several running Zeds without an ancestor is ambiguous: the
 //!      launcher aborts and asks for `--zed-path`.
-//!   3. Re-spawns itself detached (`DETACHED_PROCESS | CREATE_NO_WINDOW |
+//!   3. Reads the user's Zed config — editor mode (Vim/Helix/Normal), send
+//!      key, custom bindings — from `settings.json` / `keymap.json`, see
+//!      "Zed internals relied on" below.
+//!   4. Re-spawns itself detached (`DETACHED_PROCESS | CREATE_NO_WINDOW |
 //!      CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB`) with
-//!      `--worker`, `--message-file` and `--zed-path`.
-//!   4. Prints the worker PID + log path and exits immediately.
+//!      `--worker`, `--message-file`, `--zed-path` and the resolved keys
+//!      (`--mode`, `--toggle-keys`, `--paste-keys`, `--send-enter` /
+//!      `--send-ctrl-enter`).
+//!   5. Prints the worker PID + log path and exits immediately.
 //!
 //! **Worker** (the detached process):
 //!   1. Reads the message from the temp file (deletes it after).
@@ -31,16 +36,33 @@
 //!         grab it never steals focus and works even when Zed is front.
 //!      b. **Heads-up delay** (`--heads-up` seconds) — reaction time.
 //!      c. **Single focus** — brings Zed to the foreground (restoring it
-//!         from minimized), then injects the message
-//!         (Ctrl+Shift+/, paste, send).
+//!         from minimized), then injects the message (toggle binding,
+//!         quick-paste, send).  When the old session was not focused the
+//!         window is minimized again once the injection is done, so the
+//!         relaunch never holds focus.
 //!
 //! # Zed internals relied on
 //!
-//! * `Ctrl+Shift+/` = `agent::ToggleFocus`.  On a fresh launch the panel is
-//!   not focused, so the first press lands focus in the message editor.
+//! * `agent::ToggleFocus` — default `Ctrl+Shift+/`; the launcher reads the
+//!   user's `keymap.json` for a custom binding and hands it to the worker.
+//!   On a fresh launch the panel is not focused, so the first press lands
+//!   focus in the message editor.
 //! * `Enter` sends the message, unless the user's `settings.json` has
 //!   `"use_modifier_to_send": true` — then `Ctrl+Enter` is required.
 //!   Auto-detected; override with `--send-enter` / `--send-ctrl-enter`.
+//! * The Agent Panel message editor is a regular editor.  In Vim/Helix mode
+//!   it stays in Normal mode — both modes have a quick-paste key that reads
+//!   the Windows clipboard via `editor::Paste`: Helix `shift-r` (the fork's
+//!   helix keymap), Vim `shift-insert` (the Windows editor default, which
+//!   Vim does not shadow — `ctrl-v` is `vim::ToggleVisualBlock` there).
+//!   The worker pastes directly in Normal mode with these keys; custom
+//!   `editor::Paste` bindings from the user's keymap.json win over the
+//!   mode defaults.
+//! * `settings.json` (`vim_mode`, `helix_mode`,
+//!   `agent.use_modifier_to_send`) and `keymap.json` (custom
+//!   `agent::ToggleFocus` / `editor::Paste` bindings) are read from
+//!   `%APPDATA%\Zed` by the launcher, which passes the resolved values to
+//!   the worker explicitly; override the directory with `--config-dir`.
 //! * The worker reopens the *calling* project path (the launcher's cwd),
 //!   not whatever session-restore puts in front.  With several projects
 //!   open, session restore may bring a different window to the front than
@@ -61,7 +83,8 @@
 //! minimizes the window the moment it appears — a brief flash to the front
 //! is unavoidable — unless the old session was focused (the user is already
 //! in Zed; nothing to protect).  The injection focus restores it via
-//! `SW_RESTORE`.
+//! `SW_RESTORE`; once the message is in, the window is minimized again
+//! (old session not focused), so the whole flow never holds focus.
 //!
 //! # Why `explorer.exe`?
 //!
@@ -169,6 +192,26 @@ struct Args {
     #[arg(long, group = "send_key")]
     send_ctrl_enter: bool,
 
+    /// Zed config directory (default: %APPDATA%\Zed).  settings.json and
+    /// keymap.json are read from here.
+    #[arg(long)]
+    config_dir: Option<String>,
+
+    /// Editor mode override: normal, vim, or helix (default: inferred from
+    /// settings.json's vim_mode / helix_mode).
+    #[arg(long, value_enum)]
+    mode: Option<zed::EditorMode>,
+
+    /// agent::ToggleFocus keybinding override, e.g. "ctrl-shift-," (default:
+    /// inferred from keymap.json).
+    #[arg(long)]
+    toggle_keys: Option<String>,
+
+    /// Paste keybinding override, e.g. "shift-r" (default: inferred from
+    /// keymap.json, else the mode default).
+    #[arg(long)]
+    paste_keys: Option<String>,
+
     /// The message to inject (all remaining arguments joined with spaces).
     /// Defaults to "continue".
     #[arg(num_args = 0.., allow_hyphen_values = true)]
@@ -192,6 +235,51 @@ impl Args {
         } else {
             self.message.join(" ")
         }
+    }
+}
+
+// ===================================================================
+// injection plan (launcher-side config resolution)
+// ===================================================================
+
+/// The fully-resolved injection plan: mode, send key, and the keybindings
+/// the worker must send.  Inferred from the user's Zed config (settings.json
+/// + keymap.json), with per-flag overrides on top.
+struct InjectPlan {
+    mode: zed::EditorMode,
+    ctrl_enter: bool,
+    toggle_binding: String,
+    paste_binding: String,
+}
+
+fn plan_inject(args: &Args) -> InjectPlan {
+    let cfg = zed::load_config(&args.config_dir);
+    let mode = args.mode.unwrap_or(cfg.mode);
+    InjectPlan {
+        mode,
+        ctrl_enter: args.send_key().unwrap_or(cfg.ctrl_enter_to_send),
+        toggle_binding: args.toggle_keys.clone().unwrap_or(cfg.toggle_binding),
+        paste_binding: args
+            .paste_keys
+            .clone()
+            .or(cfg.paste_binding)
+            .unwrap_or_else(|| mode.default_paste_binding()),
+    }
+}
+
+/// Resolve the worker's injection keys from its (launcher-supplied) args.
+/// A standalone worker falls back to Zed defaults.
+fn worker_keys(args: &Args) -> work::InjectKeys {
+    let mode = args.mode.unwrap_or(zed::EditorMode::Normal);
+    let toggle_binding = args.toggle_keys.clone().unwrap_or_else(|| "ctrl-shift-/".into());
+    let paste_binding = args
+        .paste_keys
+        .clone()
+        .unwrap_or_else(|| mode.default_paste_binding());
+    work::InjectKeys {
+        ctrl_enter: args.send_key().unwrap_or(false),
+        toggle: zed::binding_to_vk(&toggle_binding, "ctrl-shift-/"),
+        paste: zed::binding_to_vk(&paste_binding, &mode.default_paste_binding()),
     }
 }
 
@@ -283,6 +371,16 @@ fn run_launcher(args: &Args) {
         args.window_timeout,
         args.heads_up,
     );
+    // Resolve the user's Zed config (editor mode, send key, custom
+    // bindings) here in the launcher and pass the result explicitly to the
+    // worker — the worker must not re-read config files, and the effective
+    // values are visible in `--check`.
+    let plan = plan_inject(args);
+    cmdline.push_str(&format!(
+        " --mode {} --toggle-keys \"{}\" --paste-keys \"{}\"",
+        plan.mode, plan.toggle_binding, plan.paste_binding,
+    ));
+    cmdline.push_str(if plan.ctrl_enter { " --send-ctrl-enter" } else { " --send-enter" });
     // The restarted Zed must land in *this* session's project.  Zed's
     // default `restore_on_startup = last_session` may bring a different
     // window to the front when several projects are open, so the
@@ -305,12 +403,6 @@ fn run_launcher(args: &Args) {
         if let Some(pid) = t.pid {
             cmdline.push_str(&format!(" --zed-pid {pid}"));
         }
-    }
-    if args.send_enter {
-        cmdline.push_str(" --send-enter");
-    }
-    if args.send_ctrl_enter {
-        cmdline.push_str(" --send-ctrl-enter");
     }
 
     use windows_sys::Win32::System::Threading::{
@@ -339,6 +431,13 @@ fn run_launcher(args: &Args) {
                 args.settle,
                 args.heads_up,
             );
+            println!("zed-reload: mode      -> {}", plan.mode);
+            println!(
+                "zed-reload: send key  -> {}",
+                if plan.ctrl_enter { "ctrl+enter" } else { "enter" },
+            );
+            println!("zed-reload: toggle    -> {}", plan.toggle_binding);
+            println!("zed-reload: paste     -> {}", plan.paste_binding);
             match &project {
                 Some(p) => println!("zed-reload: project -> {p}"),
                 None => println!("zed-reload: project -> (session restore)"),
@@ -395,6 +494,21 @@ fn run_worker(args: &Args) -> i32 {
         args.heads_up,
     ));
 
+    // The launcher resolved the user's config into explicit keys (see
+    // `plan_inject`); a standalone worker falls back to Zed defaults.
+    let keys = worker_keys(args);
+    log.info(&format!(
+        "mode={} toggle={} paste={} send={}",
+        args.mode.unwrap_or(zed::EditorMode::Normal),
+        args.toggle_keys.clone().unwrap_or_else(|| "ctrl-shift-/".into()),
+        args.paste_keys.clone().unwrap_or_else(|| {
+            args.mode
+                .unwrap_or(zed::EditorMode::Normal)
+                .default_paste_binding()
+        }),
+        if keys.ctrl_enter { "ctrl+enter" } else { "enter" },
+    ));
+
     // Resolve the exe up front (fail fast): the worker stops only the
     // target process (`--zed-pid`) and starts this exe.
     let Some(exe) = zed::find_exe(&args.zed_path) else {
@@ -423,7 +537,7 @@ fn run_worker(args: &Args) -> i32 {
                 &exe,
                 launch_after,
                 was_focused,
-                args.send_key(),
+                &keys,
             );
             // The launch is confirmed (or failed) by now; explorer has
             // parsed the shortcut long ago, so it can be removed.
@@ -481,17 +595,111 @@ fn run_check(args: &Args) -> i32 {
         );
     }
 
+    let cfg = zed::load_config(&args.config_dir);
+    let plan = plan_inject(args);
+
+    println!("  config dir : {}", cfg.dir.display());
+    println!("  edit mode  : {}", plan.mode);
     println!(
-        "  send key   : {} (auto-detected)",
-        if zed::detect_ctrl_enter() { "ctrl+enter" } else { "enter" },
+        "  send key   : {} (effective)",
+        if plan.ctrl_enter { "ctrl+enter" } else { "enter" },
     );
     println!(
-        "  toggle key : {:?} (from keymap.json)",
-        zed::detect_toggle_binding(),
+        "  toggle key : {} ({:?}) (effective)",
+        plan.toggle_binding,
+        zed::parse_binding(&plan.toggle_binding),
+    );
+    println!(
+        "  paste key  : {} ({:?}) (effective)",
+        plan.paste_binding,
+        zed::parse_binding(&plan.paste_binding),
     );
 
     let log = Log::new("check");
     println!("  log file   : {}", log.path().display());
 
     if exe_path.is_some() { 0 } else { 4 }
+}
+
+// ===================================================================
+// tests
+// ===================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_INSERT, VK_LCONTROL, VK_LSHIFT};
+
+    #[test]
+    fn plan_inject_from_fixture_config() {
+        let dir = std::env::temp_dir().join("zed-reload-plan-test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("settings.json"),
+            "{ \"helix_mode\": true, \"agent\": { \"use_modifier_to_send\": true } }",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("keymap.json"),
+            "[ { \"context\": \"Workspace\", \"bindings\": { \"ctrl-shift-,\": \"agent::ToggleFocus\" } } ]",
+        )
+        .unwrap();
+        let args = Args::parse_from(["zed-reload", "--config-dir", dir.to_str().unwrap()]);
+        let plan = plan_inject(&args);
+        assert_eq!(plan.mode, zed::EditorMode::Helix);
+        assert!(plan.ctrl_enter);
+        assert_eq!(plan.toggle_binding, "ctrl-shift-,");
+        assert_eq!(plan.paste_binding, "shift-r");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_inject_defaults_and_overrides() {
+        // No config at all: everything falls back to Zed defaults.
+        let args = Args::parse_from([
+            "zed-reload",
+            "--config-dir",
+            std::env::temp_dir().join("zed-reload-no-such-dir").to_str().unwrap(),
+        ]);
+        let plan = plan_inject(&args);
+        assert_eq!(plan.mode, zed::EditorMode::Normal);
+        assert!(!plan.ctrl_enter);
+        assert_eq!(plan.toggle_binding, "ctrl-shift-/");
+        assert_eq!(plan.paste_binding, "ctrl-v");
+
+        // Overrides win over the (absent) config.
+        let args = Args::parse_from([
+            "zed-reload",
+            "--mode",
+            "vim",
+            "--toggle-keys",
+            "ctrl-alt-/",
+            "--paste-keys",
+            "shift-insert",
+            "--send-enter",
+        ]);
+        let plan = plan_inject(&args);
+        assert_eq!(plan.mode, zed::EditorMode::Vim);
+        assert!(!plan.ctrl_enter);
+        assert_eq!(plan.toggle_binding, "ctrl-alt-/");
+        assert_eq!(plan.paste_binding, "shift-insert");
+    }
+
+    #[test]
+    fn worker_keys_paste_in_normal_mode() {
+        // Vim: quick-paste is shift-insert, pressed in Normal mode.
+        let args = Args::parse_from(["zed-reload", "--mode", "vim", "--send-ctrl-enter"]);
+        let keys = worker_keys(&args);
+        assert!(keys.ctrl_enter);
+        assert_eq!(keys.paste, vec![VK_LSHIFT, VK_INSERT]);
+
+        // Helix: quick-paste is shift-r.
+        let args = Args::parse_from(["zed-reload", "--mode", "helix"]);
+        assert_eq!(worker_keys(&args).paste, vec![VK_LSHIFT, b'R' as u16]);
+
+        // Normal mode: ctrl-v.
+        let args = Args::parse_from(["zed-reload"]);
+        assert_eq!(worker_keys(&args).paste, vec![VK_LCONTROL, b'V' as u16]);
+    }
 }

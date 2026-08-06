@@ -2,7 +2,8 @@
 //!
 //! * Finding the `Zed.exe` binary on disk.
 //! * Enumerating visible Zed windows.
-//! * Auto-detecting the Agent Panel send-key binding.
+//! * Reading the user's Zed config: editor mode (Vim/Helix/Normal), send
+//!   key, and custom keybindings from `settings.json` / `keymap.json`.
 //! * Stopping (graceful → force) and starting Zed (via `explorer.exe`).
 
 use std::env;
@@ -194,76 +195,222 @@ pub fn windows_for(exe: &Path) -> Vec<Window> {
 }
 
 // ---------------------------------------------------------------------------
-// settings detection
+// user configuration (settings.json + keymap.json)
 // ---------------------------------------------------------------------------
 
-/// Does Zed require `Ctrl+Enter` to send in the Agent Panel?
-///
-/// Reads `%APPDATA%\Zed\settings.json` and looks for
-/// `"use_modifier_to_send": true`.  Line comments (`//`) are stripped before
-/// searching — this is a best-effort heuristic, not a full JSON parse.
-pub fn detect_ctrl_enter() -> bool {
-    let Ok(appdata) = env::var("APPDATA") else {
-        return false;
-    };
-    let raw =
-        fs::read_to_string(PathBuf::from(appdata).join(r"Zed\settings.json")).unwrap_or_default();
-    let cleaned: String = raw
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let Some(pos) = cleaned.find("\"use_modifier_to_send\"") else {
-        return false;
-    };
-    let rest = &cleaned[pos + "\"use_modifier_to_send\"".len()..];
-    let after_colon = rest.trim_start().strip_prefix(':').unwrap_or("");
-    after_colon.trim_start().starts_with("true")
+/// The editor's modal mode, inferred from `settings.json` (`"vim_mode"` and
+/// the fork's `"helix_mode"`).  Determines which paste key works in Normal
+/// mode — both Vim and Helix have a normal-mode `editor::Paste` that reads
+/// the Windows clipboard, so no insert-mode detour is needed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum EditorMode {
+    Normal,
+    Vim,
+    Helix,
 }
 
-// ---------------------------------------------------------------------------
-// keybinding detection (keymap.json)
-// ---------------------------------------------------------------------------
+impl std::fmt::Display for EditorMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            EditorMode::Normal => "normal",
+            EditorMode::Vim => "vim",
+            EditorMode::Helix => "helix",
+        })
+    }
+}
 
-/// Return the virtual-key sequence for `agent::ToggleFocus`.
+impl EditorMode {
+    /// The paste key that works in *Normal* mode without switching to insert:
+    ///
+    /// * Normal (no vim) — `ctrl-v`, the Windows editor default.
+    /// * Helix — `shift-r`, the fork's `editor::Paste` in the helix keymap
+    ///   (`ctrl-v` is `vim::ToggleVisualBlock` there).
+    /// * Vim — `shift-insert`, the Windows editor default that Vim does not
+    ///   shadow (`shift-r` is `vim::SubstituteLine` in Vim normal).
+    ///
+    /// All three read the system clipboard via `editor::Paste`.
+    pub fn default_paste_binding(self) -> String {
+        match self {
+            EditorMode::Normal => "ctrl-v".into(),
+            EditorMode::Vim => "shift-insert".into(),
+            EditorMode::Helix => "shift-r".into(),
+        }
+    }
+}
+
+/// What zed-reload needs to know about the user's Zed configuration, read
+/// from `<config dir>/settings.json` and `<config dir>/keymap.json`.
+pub struct UserConfig {
+    /// The config directory that was read (for diagnostics).
+    pub dir: PathBuf,
+    /// Inferred mode: `helix_mode` wins over `vim_mode` (matches the fork).
+    pub mode: EditorMode,
+    /// `agent.use_modifier_to_send`: send with Ctrl+Enter instead of Enter.
+    pub ctrl_enter_to_send: bool,
+    /// Custom `agent::ToggleFocus` binding from keymap.json, else the Zed
+    /// default `ctrl-shift-/`.
+    pub toggle_binding: String,
+    /// Custom `editor::Paste` binding from keymap.json, if any — else the
+    /// caller falls back to `EditorMode::default_paste_binding`.
+    pub paste_binding: Option<String>,
+}
+
+/// The directory Zed reads its config from: `--config-dir` override, else
+/// `%APPDATA%\Zed`.  (Users may symlink that directory anywhere — e.g. into
+/// a git repo — so only the default is assumed, never a specific home.)
+pub fn config_dir(override_dir: &Option<String>) -> PathBuf {
+    match override_dir {
+        Some(d) => PathBuf::from(d),
+        None => env::var("APPDATA")
+            .map(|a| PathBuf::from(a).join("Zed"))
+            .unwrap_or_default(),
+    }
+}
+
+/// Read `<dir>/<name>` as JSONC: whole-line `//` comments are dropped so the
+/// heuristics below never match commented-out entries.  A missing file reads
+/// as empty, so every field falls back to a Zed default.
+fn read_config(dir: &Path, name: &str) -> String {
+    let raw = fs::read_to_string(dir.join(name)).unwrap_or_default();
+    raw.lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Best-effort detection of the modal mode from (stripped) settings text.
+/// `helix_mode` takes precedence, matching `Vim::new` in the fork.
+fn mode_from_settings(settings: &str) -> EditorMode {
+    if json_bool(settings, "helix_mode") == Some(true) {
+        EditorMode::Helix
+    } else if json_bool(settings, "vim_mode") == Some(true) {
+        EditorMode::Vim
+    } else {
+        EditorMode::Normal
+    }
+}
+
+/// `agent.use_modifier_to_send` from (stripped) settings text.
+fn ctrl_enter_to_send(settings: &str) -> bool {
+    json_bool(settings, "use_modifier_to_send") == Some(true)
+}
+
+/// Value of a boolean setting (`"key": true`): the token must directly
+/// follow the colon, so a trailing comma never matters.
+fn json_bool(text: &str, key: &str) -> Option<bool> {
+    let needle = format!("\"{key}\"");
+    let pos = text.find(&needle)?;
+    let after = text[pos + needle.len()..]
+        .trim_start()
+        .strip_prefix(':')?
+        .trim_start();
+    if after.starts_with("true") {
+        Some(true)
+    } else if after.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Every `(context, binding)` pair in the keymap whose binding value is
+/// `action`.  The key is the last quoted string before the `:` preceding the
+/// action; the context is the `"context": "…"` of the enclosing bindings
+/// object.  Comment lines were already stripped.
+fn keymap_bindings_for(keymap: &str, action: &str) -> Vec<(Option<String>, String)> {
+    let needle = format!("\"{action}\"");
+    let mut out = Vec::new();
+    let mut search_from = 0;
+    while let Some(rel) = keymap[search_from..].find(&needle) {
+        let pos = search_from + rel;
+        search_from = pos + needle.len();
+
+        let before = &keymap[..pos];
+        let Some(colon) = before.rfind(':') else { continue };
+        let key_part = &before[..colon];
+        let Some(close) = key_part.rfind('"') else { continue };
+        let Some(open) = key_part[..close].rfind('"') else { continue };
+        let binding = key_part[open + 1..close].to_string();
+
+        // Context of the enclosing bindings object, if it has one.
+        let context = before.rfind("\"bindings\"").and_then(|b| {
+            let ctx_part = &before[..b];
+            let start = ctx_part.rfind("\"context\"")? + "\"context\"".len();
+            let after = ctx_part[start..]
+                .trim_start()
+                .strip_prefix(':')?
+                .trim_start()
+                .strip_prefix('"')?;
+            let end = after.find('"')?;
+            Some(after[..end].to_string())
+        });
+
+        out.push((context, binding));
+    }
+    out
+}
+
+/// Custom `agent::ToggleFocus` binding from keymap.json, else the Zed
+/// default `ctrl-shift-/`.  Later entries in the file win, matching Zed's
+/// keymap layering.
+fn toggle_binding_for(keymap: &str) -> String {
+    keymap_bindings_for(keymap, "agent::ToggleFocus")
+        .last()
+        .map(|(_, b)| b.clone())
+        .unwrap_or_else(|| "ctrl-shift-/".into())
+}
+
+/// Custom `editor::Paste` binding from keymap.json, if any.
 ///
-/// Reads `%APPDATA%\Zed\keymap.json` and looks for a custom binding that
-/// maps to `"agent::ToggleFocus"`.  If none is found the Zed default
-/// (`Ctrl+Shift+/`) is returned.
-pub fn detect_toggle_binding() -> Vec<u16> {
-    let default: Vec<u16> = vec![
-        windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_LCONTROL,
-        windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_LSHIFT,
-        windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_OEM_2,
-    ];
+/// The binding that matters is the one live in *Normal* mode, where the
+/// injection pastes: for Vim a `vim_mode == normal` context, for Helix a
+/// `helix_normal`/`helix_select` context.  A plain-editor binding (no vim
+/// context) is the fallback — it is live in every mode unless shadowed.
+/// `None` means "use the mode default" (`ctrl-v` / `shift-insert` /
+/// `shift-r`).
+fn paste_binding_for(keymap: &str, mode: EditorMode) -> Option<String> {
+    let entries = keymap_bindings_for(keymap, "editor::Paste");
+    let mode_specific = |c: &str| match mode {
+        EditorMode::Normal => !c.contains("vim_mode"),
+        EditorMode::Vim => c.contains("vim_mode == normal"),
+        EditorMode::Helix => c.contains("helix_normal") || c.contains("helix_select"),
+    };
+    if let Some((_, b)) = entries
+        .iter()
+        .rev()
+        .find(|(c, _)| mode_specific(c.as_deref().unwrap_or("")))
+    {
+        return Some(b.clone());
+    }
+    entries
+        .iter()
+        .rev()
+        .find(|(c, _)| !c.as_deref().unwrap_or("").contains("vim_mode"))
+        .map(|(_, b)| b.clone())
+}
 
-    let Ok(appdata) = env::var("APPDATA") else {
-        return default;
-    };
-    let raw =
-        fs::read_to_string(PathBuf::from(appdata).join(r"Zed\keymap.json")).unwrap_or_default();
+/// Read the user's Zed configuration from `<dir>/settings.json` and
+/// `<dir>/keymap.json` (JSONC; missing files -> Zed defaults).
+pub fn load_config(override_dir: &Option<String>) -> UserConfig {
+    let dir = config_dir(override_dir);
+    let settings = read_config(&dir, "settings.json");
+    let keymap = read_config(&dir, "keymap.json");
+    let mode = mode_from_settings(&settings);
+    UserConfig {
+        dir,
+        mode,
+        ctrl_enter_to_send: ctrl_enter_to_send(&settings),
+        toggle_binding: toggle_binding_for(&keymap),
+        paste_binding: paste_binding_for(&keymap, mode),
+    }
+}
 
-    // Find the string `"agent::ToggleFocus"` and extract the preceding key.
-    let Some(action_pos) = raw.find("\"agent::ToggleFocus\"") else {
-        return default;
-    };
-
-    // Walk backwards from the action to find the key string before ':'
-    let before = &raw[..action_pos];
-    let Some(colon) = before.rfind(':') else {
-        return default;
-    };
-    let before_colon = &before[..colon];
-    let Some(close_quote) = before_colon.rfind('"') else {
-        return default;
-    };
-    let before_close = &before_colon[..close_quote];
-    let Some(open_quote) = before_close.rfind('"') else {
-        return default;
-    };
-    let binding_str = &before_colon[open_quote + 1..close_quote];
-
-    parse_binding(binding_str).unwrap_or(default)
+/// Parse a binding string to virtual-key codes, falling back to `fallback`
+/// (also parsed) when `binding` is not a valid binding.
+pub fn binding_to_vk(binding: &str, fallback: &str) -> Vec<u16> {
+    parse_binding(binding)
+        .or_else(|| parse_binding(fallback))
+        .unwrap_or_default()
 }
 
 /// Parse a Zed keybinding string like `"ctrl-shift-/"` into virtual-key codes.
@@ -596,5 +743,107 @@ mod tests {
         assert_eq!(title_filter(&None, &None), None);
         // A root path has no folder name to match against.
         assert_eq!(title_filter(&Some("C:\\".into()), &None), None);
+    }
+
+    #[test]
+    fn mode_from_settings_detects_helix_vim_normal() {
+        assert_eq!(mode_from_settings("\"vim_mode\": false, \"helix_mode\": true"), EditorMode::Helix);
+        // Both on: helix wins, matching Vim::new in the fork.
+        assert_eq!(mode_from_settings("\"vim_mode\": true, \"helix_mode\": true"), EditorMode::Helix);
+        assert_eq!(mode_from_settings("\"vim_mode\": true"), EditorMode::Vim);
+        assert_eq!(mode_from_settings("\"vim_mode\": false"), EditorMode::Normal);
+        assert_eq!(mode_from_settings("{}"), EditorMode::Normal);
+    }
+
+    #[test]
+    fn ctrl_enter_from_settings() {
+        assert!(ctrl_enter_to_send("\"use_modifier_to_send\": true"));
+        assert!(ctrl_enter_to_send("\"use_modifier_to_send\": true, \"x\": 1"));
+        assert!(!ctrl_enter_to_send("\"use_modifier_to_send\": false"));
+        assert!(!ctrl_enter_to_send("{}"));
+    }
+
+    /// The user's real keymap.json shape: comments, empty bindings, a
+    /// custom ToggleFocus binding, and a binding without a context.
+    const USER_KEYMAP: &str = r#"// Zed keymap
+[
+  {
+    "context": "Workspace",
+    "bindings": {
+      // "shift shift": "file_finder::Toggle"
+    },
+  },
+  {
+    "context": "Editor && vim_mode == insert",
+    "bindings": {
+      "j k": "vim::NormalBefore"
+    },
+  },
+  {
+    "context": "Workspace",
+    "bindings": {
+      "ctrl-shift-,": "agent::ToggleFocus"
+    }
+  },
+  {
+    "bindings": {
+      "win-j": "workspace::ToggleHelixMode"
+    }
+  }
+]"#;
+
+    #[test]
+    fn toggle_binding_from_user_style_keymap() {
+        assert_eq!(toggle_binding_for(USER_KEYMAP), "ctrl-shift-,");
+        assert_eq!(toggle_binding_for("[]"), "ctrl-shift-/");
+    }
+
+    #[test]
+    fn paste_binding_respects_normal_mode_contexts() {
+        let keymap = r#"[
+  { "context": "Editor", "bindings": { "ctrl-v": "editor::Paste" } },
+  { "context": "vim_mode == normal", "bindings": { "shift-insert": "editor::Paste" } },
+  { "context": "(vim_mode == helix_normal || vim_mode == helix_select) && !menu", "bindings": { "shift-r": "editor::Paste" } }
+]"#;
+        // Each mode prefers its own normal-mode context.
+        assert_eq!(paste_binding_for(keymap, EditorMode::Helix).unwrap(), "shift-r");
+        assert_eq!(paste_binding_for(keymap, EditorMode::Vim).unwrap(), "shift-insert");
+        assert_eq!(paste_binding_for(keymap, EditorMode::Normal).unwrap(), "ctrl-v");
+        // A plain-editor binding is the fallback for vim/helix.
+        let plain = r#"[
+  { "context": "Editor", "bindings": { "ctrl-alt-p": "editor::Paste" } }
+]"#;
+        assert_eq!(paste_binding_for(plain, EditorMode::Vim).unwrap(), "ctrl-alt-p");
+        assert_eq!(paste_binding_for(plain, EditorMode::Helix).unwrap(), "ctrl-alt-p");
+        // No override at all.
+        assert_eq!(paste_binding_for("[]", EditorMode::Vim), None);
+    }
+
+    #[test]
+    fn default_paste_binding_per_mode() {
+        assert_eq!(EditorMode::Normal.default_paste_binding(), "ctrl-v");
+        assert_eq!(EditorMode::Vim.default_paste_binding(), "shift-insert");
+        assert_eq!(EditorMode::Helix.default_paste_binding(), "shift-r");
+    }
+
+    #[test]
+    fn parse_binding_basics() {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            VK_LCONTROL, VK_LSHIFT, VK_OEM_2, VK_OEM_COMMA, VK_OEM_MINUS,
+        };
+        assert_eq!(parse_binding("ctrl-shift-/").unwrap(), vec![VK_LCONTROL, VK_LSHIFT, VK_OEM_2]);
+        assert_eq!(parse_binding("ctrl-shift-,").unwrap(), vec![VK_LCONTROL, VK_LSHIFT, VK_OEM_COMMA]);
+        // Minus-key edge case.
+        assert_eq!(parse_binding("ctrl-shift--").unwrap(), vec![VK_LCONTROL, VK_LSHIFT, VK_OEM_MINUS]);
+        // Insert keys: helix `a`, vim `shift-a` (same VK, different modifiers).
+        assert_eq!(parse_binding("a").unwrap(), vec![b'A' as u16]);
+        assert_eq!(parse_binding("shift-a").unwrap(), vec![VK_LSHIFT, b'A' as u16]);
+        assert_eq!(parse_binding("bogus"), None);
+    }
+
+    #[test]
+    fn binding_to_vk_falls_back() {
+        assert_eq!(binding_to_vk("bogus", "ctrl-shift-/").len(), 3);
+        assert_eq!(binding_to_vk("ctrl-v", "ctrl-shift-/").len(), 2);
     }
 }
